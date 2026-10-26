@@ -22,6 +22,8 @@ sudo bash install-nas-relay.sh --name 'My Relay' --endpoint https://192.168.1.20
 3. 選擇或拖入素材。App 顯示 Mac→中繼、中繼→NAS 的階段、速度與預估時間。只有出現「可帶走 Mac」才代表完整交接成功。
 4. 每項任務可暫停、繼續、終止。網路恢復後會從已確認的區塊續傳。
 
+同名項目會先詢問要比對、另存副本或取消；比對確認相同才略過，內容不同不會覆寫。NAS 會用「上傳中／校驗中」資料夾顯示狀態，通過校驗後才發布原名。失敗的專屬 NAS 暫存會自動清理，原始素材與中繼的驗證副本會保留以供重試。
+
 「自動選擇」會比較各伺服器可連線端點的三次驗證請求延遲，為新任務選擇最低延遲的中繼。也可手動指定。進行中的任務維持原伺服器；尚未完整交接的任務可先暫停，再改用另一台中繼。
 
 ## 資料處理
@@ -51,4 +53,4 @@ bash scripts/build-server.sh
 
 服務端不需要 Python、Node 或 Docker；Mac App 不需要外部 rsync。CI 在 Linux 與 macOS 分別執行測試及建置。
 
-[維護與安全](docs/OPERATIONS.md) · [API](docs/API.md) · [驗證紀錄](docs/VALIDATION.md)
+[介面設計](docs/DESIGN.md) · [維護與安全](docs/OPERATIONS.md) · [API](docs/API.md) · [驗證紀錄](docs/VALIDATION.md)

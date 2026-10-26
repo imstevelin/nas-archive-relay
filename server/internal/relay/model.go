@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 const ChunkSize int64 = 8 << 20
 
 var idPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -35,34 +35,39 @@ type Entry struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 type Manifest struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	TargetID string  `json:"target_id"`
-	Folder   string  `json:"folder"`
-	Entries  []Entry `json:"entries"`
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	TargetID        string  `json:"target_id"`
+	Folder          string  `json:"folder"`
+	Entries         []Entry `json:"entries"`
+	CollisionPolicy string  `json:"collision_policy,omitempty"`
 }
 type Job struct {
-	ID          string   `json:"id"`
-	Owner       string   `json:"owner"`
-	Name        string   `json:"name"`
-	TargetID    string   `json:"target_id"`
-	Folder      string   `json:"folder"`
-	ManifestSHA string   `json:"manifest_sha256"`
-	Stage       string   `json:"stage"`
-	Action      string   `json:"action"`
-	ResumeStage string   `json:"resume_stage,omitempty"`
-	Accepted    bool     `json:"accepted"`
-	Bytes       int64    `json:"bytes"`
-	Done        int64    `json:"bytes_done"`
-	Total       int64    `json:"bytes_total"`
-	Speed       float64  `json:"speed_bps"`
-	ETA         *float64 `json:"eta_seconds"`
-	Error       string   `json:"error,omitempty"`
-	Created     int64    `json:"created"`
-	Updated     int64    `json:"updated"`
-	RetryAt     int64    `json:"retry_at,omitempty"`
-	RelayClean  bool     `json:"relay_clean"`
-	NASClean    bool     `json:"nas_clean"`
+	ID              string   `json:"id"`
+	Owner           string   `json:"owner"`
+	Name            string   `json:"name"`
+	TargetID        string   `json:"target_id"`
+	Folder          string   `json:"folder"`
+	ManifestSHA     string   `json:"manifest_sha256"`
+	Stage           string   `json:"stage"`
+	Action          string   `json:"action"`
+	ResumeStage     string   `json:"resume_stage,omitempty"`
+	Accepted        bool     `json:"accepted"`
+	Bytes           int64    `json:"bytes"`
+	Done            int64    `json:"bytes_done"`
+	Total           int64    `json:"bytes_total"`
+	Speed           float64  `json:"speed_bps"`
+	ETA             *float64 `json:"eta_seconds"`
+	Error           string   `json:"error,omitempty"`
+	Created         int64    `json:"created"`
+	Updated         int64    `json:"updated"`
+	RetryAt         int64    `json:"retry_at,omitempty"`
+	RelayClean      bool     `json:"relay_clean"`
+	NASClean        bool     `json:"nas_clean"`
+	DuplicateChoice string   `json:"duplicate_choice,omitempty"`
+	ArchiveName     string   `json:"archive_name,omitempty"`
+	Published       bool     `json:"published,omitempty"`
+	CleanupError    string   `json:"cleanup_error,omitempty"`
 }
 type Target struct {
 	ID             string `json:"id"`
@@ -198,7 +203,9 @@ func Open(root string) (*Store, error) {
 		}
 		// Recover from process interruption, preserving explicit pause/cancel intent.
 		if j.Action == "paused" {
-			j.Stage = "paused"
+			if j.Stage != "awaiting_duplicate" {
+				j.Stage = "paused"
+			}
 			j.Speed = 0
 			j.ETA = nil
 		} else if j.Action == "cancelled" && j.Stage != "completed" {
@@ -312,13 +319,16 @@ func safePath(p string, allowEmpty bool) bool {
 		return false
 	}
 	for _, component := range strings.Split(p, "/") {
-		if component == "" || component == "." || component == ".." || strings.HasPrefix(component, ".nas-relay") || component == ".relay-partial" {
+		if component == "" || component == "." || component == ".." || strings.HasPrefix(strings.ToLower(component), ".nas-relay") || strings.EqualFold(component, ".relay-partial") {
 			return false
 		}
 	}
 	return path.Clean(p) == p
 }
 func ValidateManifest(m Manifest) (int64, error) {
+	if m.CollisionPolicy != "" && m.CollisionPolicy != "use-existing" && m.CollisionPolicy != "keep-both" {
+		return 0, errors.New("invalid collision policy")
+	}
 	if !idPattern.MatchString(m.ID) || !safePath(m.Name, false) || strings.Contains(m.Name, "/") || !safePath(m.Folder, true) || !idPattern.MatchString(m.TargetID) || len(m.Entries) == 0 || len(m.Entries) > 100000 {
 		return 0, errors.New("invalid manifest")
 	}

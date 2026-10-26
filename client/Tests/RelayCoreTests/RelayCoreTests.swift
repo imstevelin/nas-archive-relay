@@ -109,4 +109,8 @@ final class RelayCoreTests: XCTestCase {
         source: root, id: String(repeating: "c", count: 32),
         targetID: String(repeating: "d", count: 32), folder: "", progress: { _, _ in }))
   }
+  func testReservedNamesAreCaseInsensitive() {
+    XCTAssertFalse(Routing.safeFolder("Footage/.NAS-RELAY-INCOMPLETE.JSON"))
+    XCTAssertFalse(Routing.safeFolder(".RELAY-PARTIAL"))
+  }
 }

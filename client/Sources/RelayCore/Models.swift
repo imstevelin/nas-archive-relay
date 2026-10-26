@@ -134,6 +134,10 @@ public struct ServerJob: Codable, Identifiable, Sendable {
   public let error: String?
   public let resume_stage: String?
   public let retry_at: Int64?
+  public let archive_name: String?
+  public let relay_clean: Bool?
+  public let nas_clean: Bool?
+  public let cleanup_error: String?
 }
 public struct ManifestEntry: Codable, Sendable {
   public var path, type: String
@@ -153,9 +157,11 @@ public struct ManifestEntry: Codable, Sendable {
     self.metadata = metadata
   }
 }
+public struct PreflightReply: Decodable, Sendable { public let exists: Bool }
 public struct Manifest: Codable, Sendable {
   public var id, name, target_id, folder: String
   public var entries: [ManifestEntry]
+  public var collision_policy: String?
   public init(id: String, name: String, targetID: String, folder: String, entries: [ManifestEntry])
   {
     self.id = id
@@ -204,6 +210,7 @@ public struct LocalTask: Codable, Identifiable, Sendable {
   public var eta: Double?
   public var message: String?
   public var pendingAction: String?
+  public var duplicateChoice: String?
   public var accepted = false
   public var remote: ServerJob?
   public var created = Date().timeIntervalSince1970
@@ -220,7 +227,10 @@ public struct LocalTask: Codable, Identifiable, Sendable {
     self.folder = folder
   }
   public var finished: Bool {
-    state == "cancelled" || remote?.stage == "completed" || remote?.stage == "cancelled"
+    if let remote, ["completed", "cancelled"].contains(remote.stage) {
+      return remote.relay_clean != false && remote.nas_clean != false
+    }
+    return state == "cancelled" && remote == nil
   }
 }
 public struct RelayFailure: Error, LocalizedError, Sendable {
@@ -259,8 +269,8 @@ public enum Routing {
     return !value.hasPrefix("/") && !value.contains("\\") && !value.contains("\0")
       && !value.contains("\n") && !value.contains("\r")
       && value.split(separator: "/", omittingEmptySubsequences: false).allSatisfy {
-        !$0.isEmpty && $0 != "." && $0 != ".." && !$0.hasPrefix(".nas-relay")
-          && $0 != ".relay-partial"
+        !$0.isEmpty && $0 != "." && $0 != ".." && !$0.lowercased().hasPrefix(".nas-relay")
+          && $0.lowercased() != ".relay-partial"
       }
   }
 }

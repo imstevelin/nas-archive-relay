@@ -138,10 +138,12 @@ public final class RelayAPI: @unchecked Sendable {
     return try checked(data, response, as: T.self)
   }
   public func send<T: Decodable & Sendable>(
-    _ path: String, method: String = "POST", body: Data? = nil, endpoint: String, as: T.Type
+    _ path: String, method: String = "POST", body: Data? = nil, endpoint: String, as: T.Type,
+    timeout: Double = 30
   ) async throws -> T {
-    let (data, response) = try await session.data(
-      for: request(endpoint, path, method: method, body: body))
+    var req = try request(endpoint, path, method: method, body: body)
+    req.timeoutInterval = timeout
+    let (data, response) = try await session.data(for: req)
     return try checked(data, response, as: T.self)
   }
   public func upload(

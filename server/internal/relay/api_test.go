@@ -271,6 +271,15 @@ func TestConflictingArchiveNeverOverwritten(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(p, "existing.txt"), []byte("keep"), 0600)
 	f.a.work(m.ID)
 	j, _ := f.s.Job(m.ID)
+	if j.Stage != "awaiting_duplicate" {
+		t.Fatal(j)
+	}
+	code, body := f.request(t, f.first.Token, "POST", "/v1/jobs/"+m.ID+"/use-existing", nil, nil)
+	if code != 200 {
+		t.Fatalf("confirm %d %s", code, body)
+	}
+	f.a.work(m.ID)
+	j, _ = f.s.Job(m.ID)
 	if j.Stage != "conflict" {
 		t.Fatal(j)
 	}

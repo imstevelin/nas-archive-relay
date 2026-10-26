@@ -20,12 +20,13 @@ import (
 
 type principalKey struct{}
 type Server struct {
-	Store         *Store
-	ResolveTarget func(Target) (string, error)
-	active        sync.Map
-	ingest        chan struct{}
-	archive       chan struct{}
-	cleanup       chan struct{}
+	Store          *Store
+	ResolveTarget  func(Target) (string, error)
+	active         sync.Map
+	ingest         chan struct{}
+	archive        chan struct{}
+	cleanup        chan struct{}
+	preflightSlots chan struct{}
 }
 
 func NewServer(s *Store) *Server {
@@ -33,7 +34,7 @@ func NewServer(s *Store) *Server {
 	if workers < 1 {
 		workers = 1
 	}
-	return &Server{Store: s, ResolveTarget: s.EnsureMount, ingest: make(chan struct{}, 1), archive: make(chan struct{}, workers), cleanup: make(chan struct{}, 1)}
+	return &Server{Store: s, ResolveTarget: s.EnsureMount, ingest: make(chan struct{}, 1), archive: make(chan struct{}, workers), cleanup: make(chan struct{}, 1), preflightSlots: make(chan struct{}, 2)}
 }
 func write(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -156,6 +157,7 @@ func (a *Server) Handler() http.Handler {
 	})
 	m.HandleFunc("GET /v1/jobs", a.listJobs)
 	m.HandleFunc("POST /v1/jobs", a.createJob)
+	m.HandleFunc("POST /v1/preflight", a.preflight)
 	m.HandleFunc("GET /v1/jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		j, ok := a.authorizedJob(w, r)
 		if ok {
@@ -332,6 +334,10 @@ func (a *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	j := Job{ID: m.ID, Owner: principal(r).ID, Name: m.Name, TargetID: m.TargetID, Folder: m.Folder, ManifestSHA: digest, Stage: "receiving", Action: "running", Bytes: total, Total: total, Created: time.Now().UnixMilli(), Updated: time.Now().UnixMilli()}
+	j.DuplicateChoice = m.CollisionPolicy
+	if m.CollisionPolicy == "keep-both" {
+		j.ArchiveName = copyName(m.Name, m.ID)
+	}
 	if err = atomicJSON(a.Store.jobPath(m.ID, "manifest.json"), m); err == nil {
 		err = atomicJSON(a.Store.jobPath(m.ID, "state.json"), j)
 	}
@@ -620,8 +626,16 @@ func (a *Server) control(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := r.PathValue("action")
-	if action != "pause" && action != "resume" && action != "cancel" && action != "retry" {
+	if action != "pause" && action != "resume" && action != "cancel" && action != "retry" && action != "use-existing" && action != "keep-both" {
 		problem(w, 404, os.ErrNotExist)
+		return
+	}
+	if (action == "resume" || action == "retry") && j.Stage == "awaiting_duplicate" {
+		problem(w, 409, errors.New("choose compare, keep both, or cancel first"))
+		return
+	}
+	if (action == "use-existing" || action == "keep-both") && (!j.Accepted || (j.Stage != "awaiting_duplicate" && j.Stage != "conflict")) {
+		problem(w, 409, errors.New("task is not awaiting a duplicate decision"))
 		return
 	}
 	err := a.Store.Update(j.ID, func(v *Job) error {
@@ -639,7 +653,22 @@ func (a *Server) control(w http.ResponseWriter, r *http.Request) {
 			} else {
 				v.Stage = "pausing"
 			}
+		case "use-existing", "keep-both":
+			if !v.Accepted || (v.Stage != "awaiting_duplicate" && v.Stage != "conflict") {
+				return errors.New("this task is not waiting for a duplicate decision")
+			}
+			v.DuplicateChoice = action
+			if action == "keep-both" {
+				v.ArchiveName = copyName(v.Name, v.ID)
+			}
+			v.Action = "running"
+			v.Stage = "queued"
+			v.Error = ""
+			v.RetryAt = 0
 		case "resume", "retry":
+			if v.Stage == "awaiting_duplicate" {
+				return errors.New("choose compare, keep both, or cancel first")
+			}
 			v.Action = "running"
 			v.Error = ""
 			v.RetryAt = 0

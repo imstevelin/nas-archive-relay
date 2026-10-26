@@ -11,9 +11,22 @@ func remaining(_ n: Double?) -> String {
   if n < 3600 { return "約 \(Int(n/60)) 分" }
   return "約 \(Int(n/3600)) 小時 \(Int(n.truncatingRemainder(dividingBy:3600)/60)) 分"
 }
+func issue(_ text: String) -> String {
+  if text.contains("NAS already contains") { return "NAS 已有同名項目，請選擇比對、另存副本或取消。" }
+  if text.contains("payload is damaged") { return "中繼副本校驗失敗。請取消此任務，再重新加入原始素材。" }
+  if text.contains("SHA-256") || text.contains("digest") { return "檔案校驗未通過。來源已保留，可重新嘗試歸檔。" }
+  if text.contains("cleanup pending") { return "NAS 暫存尚待清理。連線恢復後會自動重試，原始素材已保留。" }
+  if text.contains("mount failed") || text.contains("target unavailable") {
+    return "無法連接 NAS。請確認 NAS 與 VPN 連線；中繼會保留素材並自動重試。"
+  }
+  if text.contains("offset changed") { return "正在重新確認續傳位置，請稍候再試。" }
+  return text
+}
 func phase(_ value: String) -> String {
   [
-    "queued": "等待歸檔", "receiving": "等待素材上傳", "preparing": "建立 SHA-256 清單", "uploading": "傳送素材",
+    "checking_destination": "檢查歸檔位置", "awaiting_duplicate_local": "NAS 已有同名項目，請選擇處理方式",
+    "awaiting_duplicate": "NAS 已有同名項目，請選擇處理方式", "queued": "等待歸檔", "receiving": "等待素材上傳",
+    "preparing": "建立 SHA-256 清單", "uploading": "傳送素材",
     "checking_source": "確認原始素材", "verifying_receive": "中繼接收校驗", "handed_off": "已完整交接",
     "paused": "已暫停", "pausing": "正在暫停", "resuming": "正在恢復", "copying": "上傳 NAS",
     "checking_relay": "檢查中繼內容", "checking_existing": "比對 NAS 既有內容", "verifying_nas": "校驗 NAS 內容",
@@ -41,9 +54,11 @@ struct ImportView: View {
           let panel = NSOpenPanel()
           panel.canChooseDirectories = false
           panel.allowedContentTypes = [.json, .plainText]
-          if panel.runModal() == .OK, let url = panel.url {
-            do { text = try String(contentsOf: url, encoding: .utf8) } catch {
-              self.error = error.localizedDescription
+          panel.begin { response in
+            if response == .OK, let url = panel.url {
+              do { text = try String(contentsOf: url, encoding: .utf8) } catch {
+                self.error = error.localizedDescription
+              }
             }
           }
         }
@@ -78,9 +93,10 @@ struct TargetEditor: View {
           Text("NFS").tag("nfs")
           Text("SMB").tag("smb")
         }.pickerStyle(.segmented)
-        TextField("NAS 主機或 IP", text: $target.host)
+        TextField("NAS 位址", text: $target.host, prompt: Text("例如 192.168.1.10 或 nas.local"))
         if target.protocol == "nfs" {
-          TextField("NFS 匯出路徑", text: $target.export)
+          TextField(
+            "共用路徑", text: $target.export, prompt: Text("由 NAS 的 NFS 設定提供，例如 /mnt/pool/archive"))
           Picker("NFS 版本", selection: $target.nfs_version) {
             Text("4.2（建議）").tag("4.2")
             Text("4.1").tag("4.1")
@@ -88,7 +104,7 @@ struct TargetEditor: View {
             Text("3").tag("3")
           }
         } else {
-          TextField("SMB 共享名稱", text: $target.share)
+          TextField("共用資料夾名稱", text: $target.share, prompt: Text("例如 Archive，無須輸入 smb://"))
           TextField(
             "帳號", text: Binding(get: { target.username ?? "" }, set: { target.username = $0 }))
           SecureField(target.has_credentials ? "密碼（留空沿用）" : "密碼", text: $password)
@@ -103,14 +119,15 @@ struct TargetEditor: View {
         if busy { ProgressView().controlSize(.small) }
         Spacer()
         Button("取消") { dismiss() }.disabled(busy)
-        Button("儲存") {
+        Button("測試連線並儲存") {
           busy = true
           Task {
             do {
-              _ = try await store.saveTarget(
+              target = try await store.saveTarget(
                 TargetInput(target: target, password: password.isEmpty ? nil : password),
                 server: server)
               password = ""
+              _ = try await store.testTarget(target, server: server)
               dismiss()
             } catch {
               self.error = error.localizedDescription
@@ -320,7 +337,7 @@ struct TaskRow: View {
     return task.bytes > 0 ? Double(task.uploaded) / Double(task.bytes) : 0
   }
   var nasProgress: Double {
-    guard let remote else { return 0 }
+    guard let remote, remote.accepted else { return 0 }
     if ["verifying_nas", "publishing", "completed"].contains(remote.stage) { return 1 }
     return remote.bytes_total > 0 ? Double(remote.bytes_done) / Double(remote.bytes_total) : 0
   }
@@ -335,33 +352,39 @@ struct TaskRow: View {
           Text(task.name).font(.headline).textSelection(.enabled)
           Text(
             (store.profiles.first { $0.id == task.serverID }?.name ?? "中繼") + " · "
-              + bytes(task.bytes)
+              + (task.bytes == 0
+                && ["preparing", "checking_destination", "awaiting_duplicate_local"].contains(
+                  task.state)
+                ? "尚未傳送" : bytes(task.bytes))
           ).font(.caption).foregroundStyle(.secondary)
         }
         Spacer()
         if task.accepted && !task.finished {
           Label("可帶走 Mac", systemImage: "laptopcomputer").font(.caption).foregroundStyle(.green)
         }
-        if !task.finished {
+        if !task.finished && !["completed", "cancelled"].contains(remote?.stage ?? "")
+          && task.state != "awaiting_duplicate_local"
+          && !["awaiting_duplicate", "conflict"].contains(remote?.stage ?? "")
+        {
           if paused || ["error", "retry_pending"].contains(task.state)
             || ["failed", "conflict"].contains(remote?.stage ?? "")
           {
             Button {
               store.resume(task.id)
             } label: {
-              Image(systemName: "play.fill")
+              Label("繼續", systemImage: "play.fill")
             }.help("繼續／重試")
           } else {
             Button {
               store.pause(task.id)
             } label: {
-              Image(systemName: "pause.fill")
+              Label("暫停", systemImage: "pause.fill")
             }.help("暫停")
           }
           Button(role: .destructive) {
             confirmCancel = true
           } label: {
-            Image(systemName: "stop.fill")
+            Label("終止", systemImage: "stop.fill")
           }.help("終止任務")
           if paused && !task.accepted {
             Menu {
@@ -371,22 +394,58 @@ struct TaskRow: View {
               }
             } label: {
               Image(systemName: "arrow.triangle.swap")
-            }.help("切換到其他中繼")
+            }.menuStyle(.borderlessButton).fixedSize().frame(width: 32).help("切換到其他中繼")
           }
         }
+      }
+      if task.state == "awaiting_duplicate_local"
+        || ["awaiting_duplicate", "conflict"].contains(remote?.stage ?? "")
+      {
+        VStack(alignment: .leading, spacing: 10) {
+          Label(
+            remote?.stage == "conflict" ? "NAS 的同名內容與這份素材不同" : "NAS 已有「\(task.name)」",
+            systemImage: "doc.on.doc"
+          ).font(.headline)
+          Text("比對會先將素材交給中繼，再校驗 NAS 既有內容；相同便略過 NAS 寫入，不同則停止並保留來源。另存副本會使用新名稱。").font(.callout)
+            .foregroundStyle(
+              .secondary)
+          HStack {
+            Button("比對既有內容") { store.resolveDuplicate(task.id, keepBoth: false) }
+            Button("另存副本") { store.resolveDuplicate(task.id, keepBoth: true) }.buttonStyle(
+              .borderedProminent)
+            Button("取消這項任務", role: .destructive) { confirmCancel = true }
+          }
+        }.padding(12).frame(maxWidth: .infinity, alignment: .leading).background(
+          .quaternary, in: RoundedRectangle(cornerRadius: 10))
+      }
+      if let name = remote?.archive_name, !name.isEmpty {
+        Label("NAS 名稱：" + name, systemImage: "folder").font(.caption).foregroundStyle(.secondary)
       }
       HStack(alignment: .top, spacing: 24) {
         ProgressCard(
           title: "Mac → 中繼", label: task.accepted ? "完整接收並校驗" : phase(task.state),
           value: localProgress, rate: task.speed, eta: task.eta, complete: task.accepted)
         ProgressCard(
-          title: "中繼 → NAS", label: remote.map { phase($0.stage) } ?? "等待完整交接", value: nasProgress,
-          rate: remote?.speed_bps ?? 0, eta: remote?.eta_seconds, complete: completed)
+          title: "中繼 → NAS", label: remote?.accepted == true ? phase(remote!.stage) : "等待完整交接",
+          value: nasProgress,
+          rate: remote?.accepted == true ? remote!.speed_bps : 0,
+          eta: remote?.accepted == true ? remote!.eta_seconds : nil, complete: completed)
+      }
+      if let remote, ["completed", "cancelled"].contains(remote.stage),
+        remote.nas_clean == false || remote.relay_clean == false
+      {
+        Label("正在清理任務暫存，完成後會自動移到已結束。", systemImage: "clock").font(.caption).foregroundStyle(
+          .secondary)
+      }
+      if let cleanup = remote?.cleanup_error, !cleanup.isEmpty {
+        Label("NAS 暫存尚待清理；中繼會自動重試。", systemImage: "exclamationmark.triangle").font(.caption)
+          .foregroundStyle(.orange)
       }
       if let message = task.message ?? remote?.error, !message.isEmpty {
-        Label(message, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(
-          .orange
-        ).textSelection(.enabled)
+        Label(issue(message), systemImage: "exclamationmark.triangle").font(.caption)
+          .foregroundStyle(
+            .orange
+          ).textSelection(.enabled)
       }
     }.padding(.vertical, 12).accessibilityElement(children: .contain).contextMenu {
       Button("在 Finder 顯示原始素材") {
@@ -405,170 +464,273 @@ struct TaskRow: View {
     }
   }
 }
+struct DestinationView: View {
+  @ObservedObject var store: Store
+  @Environment(\.dismiss) var dismiss
+  var body: some View {
+    VStack(alignment: .leading, spacing: 20) {
+      Text("選擇歸檔位置").font(.title2.bold())
+      Form {
+        Picker(
+          "中繼伺服器",
+          selection: Binding(
+            get: { store.route },
+            set: {
+              store.route = $0
+              store.persistProfiles()
+            })
+        ) {
+          Text("自動選擇最快的連線").tag("auto")
+          ForEach(store.profiles) { Text($0.name).tag($0.id) }
+        }
+        if let id = store.activeServer, let h = store.health[id] {
+          Picker(
+            "歸檔到",
+            selection: Binding(
+              get: { store.targetID(id) }, set: { store.setTarget($0, server: id) })
+          ) {
+            Text("選擇 NAS 資料夾").tag("")
+            ForEach(h.targets.filter(\.enabled)) { Text($0.name).tag($0.id) }
+          }
+          TextField(
+            "其中的子資料夾",
+            text: Binding(get: { store.folder(id) }, set: { store.setFolder($0, server: id) }),
+            prompt: Text("留空使用共用資料夾本身"))
+          Text("使用相對路徑，例如「2026/Podcast」。這裡的選擇只影響之後加入的任務。").font(.caption).foregroundStyle(
+            .secondary)
+        } else {
+          Text("這台中繼暫時無法連線。請確認它已開機，且目前網路或 VPN 可以到達。").foregroundStyle(.secondary)
+        }
+      }.formStyle(.grouped)
+      HStack {
+        Spacer()
+        Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+      }
+    }.padding(24).frame(width: 540)
+  }
+}
 struct MainView: View {
   @ObservedObject var store: Store
   @State private var importing = false
+  @State private var destination = false
   @State private var managing: String?
-  @State private var drop = false
   @State private var filter = "active"
+  @State private var drop = false
+  var ready: Bool {
+    guard let id = store.activeServer else { return false }
+    return store.health[id]?.targets.contains { $0.id == store.targetID(id) && $0.enabled } ?? false
+  }
+  var activeName: String { store.selectedProfile?.name ?? "尚未連線" }
+  var targetName: String {
+    guard let id = store.activeServer else { return "選擇 NAS 資料夾" }
+    return store.health[id]?.targets.first { $0.id == store.targetID(id) }?.name ?? "設定 NAS 資料夾"
+  }
+  var visible: [LocalTask] {
+    store.tasks.filter { filter == "all" || (filter == "done" ? $0.finished : !$0.finished) }
+  }
   var body: some View {
     NavigationSplitView {
-      List {
-        Button {
-          store.route = "auto"
-          store.persistProfiles()
-        } label: {
-          Label("自動選擇最低延遲", systemImage: store.route == "auto" ? "bolt.circle.fill" : "bolt.circle")
-        }.buttonStyle(.plain).padding(.vertical, 6)
-        Section("已連接的中繼") {
-          ForEach(store.profiles) { profile in
-            VStack(alignment: .leading, spacing: 5) {
-              HStack {
-                Button {
-                  store.route = profile.id
-                  store.persistProfiles()
-                } label: {
-                  Label(
-                    profile.name,
-                    systemImage: store.activeServer == profile.id
-                      ? "server.rack" : "externaldrive.connected.to.line.below")
-                }.buttonStyle(.plain)
-                Spacer()
-                Circle().fill(store.health[profile.id] == nil ? Color.orange : Color.green).frame(
-                  width: 7, height: 7)
-              }
-              if let h = store.health[profile.id] {
-                Text(
-                  String(format: "%.1f ms", h.latency) + " · "
-                    + (URL(string: h.endpoint)?.host ?? h.endpoint)
-                ).font(.caption).foregroundStyle(.secondary)
-              } else {
-                Text(store.connectionErrors[profile.id] ?? "連線中…").font(.caption).foregroundStyle(
-                  .secondary
-                ).lineLimit(2)
-              }
-            }.padding(.vertical, 5).accessibilityElement(children: .contain).accessibilityAction {
-              store.route = profile.id
+      List(
+        selection: Binding<String?>(
+          get: { store.route },
+          set: {
+            if let value = $0 {
+              store.route = value
               store.persistProfiles()
-            }.contextMenu {
-              Button("設定與 NAS…") { managing = profile.id }
-              Button("移除中繼", role: .destructive) { store.removeProfile(profile.id) }
+            }
+          })
+      ) {
+        Label("自動選擇", systemImage: "bolt.horizontal.circle").tag("auto")
+        Section("中繼伺服器") {
+          ForEach(store.profiles) { profile in
+            HStack(alignment: .top, spacing: 9) {
+              Image(systemName: "server.rack").foregroundStyle(.secondary)
+              VStack(alignment: .leading, spacing: 4) {
+                Text(profile.name).fontWeight(.medium)
+                if let h = store.health[profile.id] {
+                  Text(String(format: "已連線 · %.0f ms", h.latency)).font(.caption).foregroundStyle(
+                    .secondary)
+                } else {
+                  Text(store.connectionErrors[profile.id] == nil ? "連線中…" : "無法連線").font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+              }
+              Spacer()
+              Circle().fill(store.health[profile.id] == nil ? Color.orange : .green).frame(
+                width: 6, height: 6
+              ).padding(.top, 6)
+            }.padding(.vertical, 5).tag(profile.id).contextMenu {
+              Button("伺服器設定…") { managing = profile.id }
+              Button("移除連線", role: .destructive) { store.removeProfile(profile.id) }
             }
           }
         }
-        Button("連接中繼…", systemImage: "plus") { importing = true }
-      }.navigationTitle("中繼伺服器").navigationSplitViewColumnWidth(min: 210, ideal: 250)
+      }.navigationTitle("NAS Relay").navigationSplitViewColumnWidth(min: 200, ideal: 230)
+        .safeAreaInset(edge: .bottom) {
+          Button("加入伺服器…", systemImage: "plus") { importing = true }.buttonStyle(.borderless)
+            .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        }
     } detail: {
       VStack(spacing: 0) {
-        VStack(alignment: .leading, spacing: 14) {
-          HStack {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("NAS Relay").font(.largeTitle.bold())
-              Text(store.route == "auto" ? "新任務自動使用最低延遲的中繼" : "新任務使用指定中繼").foregroundStyle(
-                .secondary)
-            }
-            Spacer()
-            if let id = store.activeServer {
-              Button("NAS 與預設位置…", systemImage: "gearshape") { managing = id }
-            }
-            Button {
-              Task { await store.refresh() }
-            } label: {
-              Image(systemName: "arrow.clockwise")
-            }.disabled(store.refreshing)
-          }
-          if let id = store.activeServer, let h = store.health[id] {
-            HStack {
-              Label(store.profiles.first { $0.id == id }?.name ?? "中繼", systemImage: "network")
-                .font(.headline)
-              Spacer()
-              Text("中繼可用 " + bytes(h.info.free_bytes)).font(.caption).foregroundStyle(.secondary)
-            }
-            HStack {
-              Picker(
-                "歸檔 NAS",
-                selection: Binding(
-                  get: { store.targetID(id) }, set: { store.setTarget($0, server: id) })
-              ) {
-                Text("選擇 NAS").tag("")
-                ForEach(h.targets.filter(\.enabled)) { Text($0.name).tag($0.id) }
-              }
-              TextField(
-                "預設相對資料夾",
-                text: Binding(get: { store.folder(id) }, set: { store.setFolder($0, server: id) })
-              ).textFieldStyle(.roundedBorder)
-            }
-          }
-          VStack(spacing: 8) {
-            Image(systemName: "tray.and.arrow.up.fill").font(.system(size: 28)).foregroundStyle(
+        if store.profiles.isEmpty {
+          VStack(alignment: .leading, spacing: 24) {
+            Image(systemName: "tray.and.arrow.up.fill").font(.system(size: 44)).foregroundStyle(
               .tint)
-            Text("將素材資料夾或檔案拖到這裡").font(.headline)
-            Text("原始素材保留；完整交接後，由中繼獨立歸檔與校驗。").font(.caption).foregroundStyle(.secondary)
-            Button("加入素材…") { store.choose() }.buttonStyle(.borderedProminent).disabled(
-              store.activeServer == nil)
-          }.frame(maxWidth: .infinity).padding(18).background(
-            drop ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.04),
-            in: RoundedRectangle(cornerRadius: 12)
-          ).overlay(
-            RoundedRectangle(cornerRadius: 12).strokeBorder(
-              drop ? Color.accentColor : Color.secondary.opacity(0.3),
-              style: StrokeStyle(lineWidth: 1.5, dash: [6]))
-          ).onDrop(of: [UTType.fileURL.identifier], isTargeted: $drop) { providers in
-            for provider in providers {
-              _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { Task { @MainActor in store.add([url]) } }
+            Text("把歸檔工作交給中繼").font(.largeTitle.bold())
+            Text("先將素材完整交給小主機，再由它上傳 NAS。完成交接後，你就能帶走 Mac。").font(.title3).foregroundStyle(.secondary)
+            setupStep("1", "連接中繼", "貼上安裝服務端時提供的連線資訊。")
+            setupStep("2", "設定 NAS 資料夾", "選擇要存放素材的共享位置，並測試連線。")
+            setupStep("3", "加入素材", "拖入檔案或資料夾，就能追蹤歸檔進度。")
+            Button("連接第一台中繼…", systemImage: "plus") { importing = true }.buttonStyle(
+              .borderedProminent
+            ).controlSize(.large)
+          }.padding(40).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        } else {
+          VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("檔案歸檔").font(.largeTitle.bold())
+                Text("原始素材會留在 Mac，完成歸檔後自動清空中繼暫存。").foregroundStyle(.secondary)
+              }
+              Spacer()
+              if let id = store.activeServer {
+                Button {
+                  managing = id
+                } label: {
+                  Label("伺服器設定", systemImage: "gearshape")
+                }.help("設定 NAS、預設資料夾與用戶端")
               }
             }
-            return !providers.isEmpty
-          }
-          if let error = store.error {
-            HStack {
-              Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(
-                .orange)
-              Spacer()
-              Button("關閉") { store.error = nil }.buttonStyle(.plain)
+            if ready {
+              HStack(spacing: 12) {
+                Image(systemName: "externaldrive.badge.checkmark").font(.title2).foregroundStyle(
+                  .tint)
+                VStack(alignment: .leading, spacing: 4) {
+                  Text("歸檔到「\(targetName)」").font(.headline)
+                  let folder = store.activeServer.map { store.folder($0) } ?? ""
+                  Text(activeName + (folder.isEmpty ? " · 共用資料夾" : " · " + folder)).font(.caption)
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Spacer()
+                Button("變更…") { destination = true }
+              }.padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+              VStack(spacing: 10) {
+                Image(systemName: "arrow.up.doc").font(.system(size: 26)).foregroundStyle(.tint)
+                Text("將檔案或資料夾拖到這裡").font(.headline)
+                Button("選擇檔案…") { store.choose() }.buttonStyle(.borderedProminent)
+              }.padding(20).frame(maxWidth: .infinity).background(
+                drop ? Color.accentColor.opacity(0.1) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 12)
+              )
+              .overlay(
+                RoundedRectangle(cornerRadius: 12).strokeBorder(
+                  drop ? Color.accentColor : Color.secondary.opacity(0.35),
+                  style: StrokeStyle(lineWidth: 1, dash: [5]))
+              )
+              .onDrop(of: [UTType.fileURL.identifier], isTargeted: $drop) { providers in
+                for p in providers {
+                  _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { Task { @MainActor in store.add([url]) } }
+                  }
+                }
+                return !providers.isEmpty
+              }
+            } else {
+              VStack(alignment: .leading, spacing: 12) {
+                Label(
+                  store.activeServer == nil ? "中繼目前無法連線" : "接著，設定歸檔位置",
+                  systemImage: store.activeServer == nil
+                    ? "wifi.exclamationmark" : "folder.badge.gearshape"
+                ).font(.headline)
+                Text(
+                  store.activeServer == nil
+                    ? "請確認小主機已開機，且網路或 VPN 已連線。任務會保留，恢復連線後可繼續。" : "告訴中繼要連接哪一台 NAS，選擇共用資料夾，再測試是否能讀寫。"
+                ).font(.callout).foregroundStyle(.secondary)
+                if let id = store.activeServer {
+                  Button("設定 NAS 資料夾…") { managing = id }.buttonStyle(.borderedProminent)
+                } else {
+                  Button("重新連線") { Task { await store.refresh() } }
+                }
+              }.padding(18).frame(maxWidth: .infinity, alignment: .leading).background(
+                .quaternary, in: RoundedRectangle(cornerRadius: 12))
+            }
+            if let error = store.error {
+              HStack {
+                Label(error, systemImage: "exclamationmark.triangle").font(.callout)
+                  .foregroundStyle(.orange)
+                Spacer()
+                Button("關閉") { store.error = nil }
+              }
+            }
+          }.padding(24)
+          Divider()
+          HStack {
+            Picker("顯示任務", selection: $filter) {
+              Text("進行中").tag("active")
+              Text("全部").tag("all")
+              Text("已結束").tag("done")
+            }.pickerStyle(.segmented).frame(width: 270)
+            Spacer()
+            Text("\(visible.count) 項任務").font(.caption).foregroundStyle(.secondary)
+          }.padding(.horizontal, 24).padding(.vertical, 12)
+          if visible.isEmpty {
+            ContentUnavailableView(
+              filter == "active" ? "沒有進行中的歸檔" : "尚無歸檔紀錄", systemImage: "tray",
+              description: Text(ready ? "加入素材後，這裡會顯示兩段傳輸與校驗進度。" : "完成上方設定後即可開始。")
+            ).frame(maxHeight: .infinity)
+          } else {
+            ScrollView {
+              LazyVStack(spacing: 0) {
+                ForEach(visible) { task in
+                  TaskRow(store: store, task: task).padding(.horizontal, 24)
+                  Divider().padding(.horizontal, 24)
+                }
+              }
             }
           }
-        }.padding(22)
-        Divider()
-        HStack {
-          Picker("任務", selection: $filter) {
-            Text("進行中").tag("active")
-            Text("全部").tag("all")
-            Text("已完成").tag("done")
-          }.pickerStyle(.segmented).frame(width: 280)
-          Spacer()
-          Text("\(store.tasks.count) 項任務").font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 20).padding(.vertical, 10)
-        let visible = store.tasks.filter {
-          filter == "all" || (filter == "done" ? $0.finished : !$0.finished)
-        }
-        if visible.isEmpty {
-          ContentUnavailableView(
-            store.profiles.isEmpty ? "先連接一台中繼" : store.tasks.isEmpty ? "尚未加入素材" : "目前沒有符合條件的任務",
-            systemImage: "shippingbox",
-            description: Text(store.profiles.isEmpty ? "使用服務端安裝後提供的連線資訊。" : "加入素材後可監看兩段傳輸與校驗。")
-          ).frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-          List(visible) { TaskRow(store: store, task: $0) }.listStyle(.inset)
         }
         Divider()
-        HStack {
-          Image(systemName: store.pendingLocal == 0 ? "checkmark.circle" : "laptopcomputer")
+        HStack(spacing: 8) {
+          Image(systemName: store.pendingLocal == 0 ? "checkmark.circle.fill" : "laptopcomputer")
             .foregroundStyle(store.pendingLocal == 0 ? .green : .secondary)
           Text(
             store.pendingLocal == 0
-              ? "已交接任務由中繼獨立處理，可帶走 Mac。" : "\(store.pendingLocal) 項任務尚需 Mac；暫停或退出後可續傳。"
+              ? (store.tasks.isEmpty ? "準備好後就能加入素材" : "沒有需要保持 Mac 連線的任務。")
+              : "\(store.pendingLocal) 項任務尚未完整交接，請保持 Mac 連線。"
           ).font(.caption)
           Spacer()
           Text("關閉視窗會繼續傳送").font(.caption).foregroundStyle(.secondary)
         }.padding(14)
-      }.frame(minWidth: 760, minHeight: 700)
-    }.sheet(isPresented: $importing) { ImportView(store: store) }.sheet(
-      isPresented: Binding(get: { managing != nil }, set: { if !$0 { managing = nil } })
-    ) { if let id = managing { ServerManager(store: store, server: id) } }
+      }.frame(minWidth: 670, minHeight: 650)
+        .navigationTitle("歸檔")
+        .toolbar {
+          ToolbarItem {
+            Button {
+              Task { await store.refresh() }
+            } label: {
+              Label("重新連線", systemImage: "arrow.clockwise")
+            }.disabled(store.refreshing)
+          }
+        }
+    }
+    .sheet(isPresented: $importing) { ImportView(store: store) }
+    .sheet(isPresented: $destination) { DestinationView(store: store) }
+    .sheet(isPresented: Binding(get: { managing != nil }, set: { if !$0 { managing = nil } })) {
+      if let id = managing { ServerManager(store: store, server: id) }
+    }
+  }
+  func setupStep(_ number: String, _ title: String, _ detail: String) -> some View {
+    HStack(alignment: .top, spacing: 14) {
+      Text(number).font(.headline).foregroundStyle(.tint).frame(width: 30, height: 30).background(
+        Color.accentColor.opacity(0.12), in: Circle())
+      VStack(alignment: .leading, spacing: 3) {
+        Text(title).font(.headline)
+        Text(detail).foregroundStyle(.secondary)
+      }
+    }
   }
 }
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var store: Store?
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

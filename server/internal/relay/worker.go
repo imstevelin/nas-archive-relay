@@ -128,7 +128,7 @@ func (a *Server) dispatch() {
 	a.Store.mu.Unlock()
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Created < jobs[j].Created })
 	for _, j := range jobs {
-		if (j.Stage == "completed" || j.Stage == "cancelled") && (!j.RelayClean || !j.NASClean) {
+		if ((j.Stage == "completed" || j.Stage == "cancelled") && (!j.RelayClean || !j.NASClean)) || ((j.Stage == "failed" || j.Stage == "conflict") && !j.NASClean) {
 			if j.RetryAt > time.Now().UnixMilli() {
 				continue
 			}
@@ -144,7 +144,7 @@ func (a *Server) dispatch() {
 					defer lock.Unlock()
 					if err := a.cleanupFinished(id, "", true); err != nil {
 						_ = a.Store.Update(id, func(v *Job) error {
-							v.Error = "temporary cleanup pending: " + err.Error()
+							v.CleanupError = err.Error()
 							v.RetryAt = time.Now().Add(30 * time.Second).UnixMilli()
 							return nil
 						})
@@ -199,7 +199,7 @@ func (a *Server) work(id string) {
 			err = a.archiveJob(id)
 		}
 	}
-	if err == nil {
+	if err == nil || errors.Is(err, errDuplicateDecision) {
 		return
 	}
 	if errors.Is(err, ErrCancelled) {
@@ -210,14 +210,20 @@ func (a *Server) work(id string) {
 		_ = a.Store.Update(id, func(j *Job) error { j.Stage = "paused"; j.Speed = 0; j.ETA = nil; return nil })
 		return
 	}
+	cleanupErr := a.cleanupNASWork(id, "")
 	var conflict conflictError
 	var damaged payloadError
 	_ = a.Store.Update(id, func(j *Job) error {
 		j.Error = err.Error()
+		j.NASClean = cleanupErr == nil
+		if cleanupErr != nil {
+			j.CleanupError = cleanupErr.Error()
+		}
 		j.Speed = 0
 		j.ETA = nil
 		if j.Stage == "completed" || j.Stage == "cancelled" {
-			j.Error = "temporary cleanup pending: " + err.Error()
+			j.CleanupError = err.Error()
+			j.Error = ""
 			j.RetryAt = time.Now().Add(30 * time.Second).UnixMilli()
 		} else if errors.As(err, &conflict) {
 			j.Stage = "conflict"
@@ -277,150 +283,6 @@ func internalDirectory(base, name string) (string, error) {
 	}
 	return p, nil
 }
-func (a *Server) archiveJob(id string) error {
-	j, _ := a.Store.Job(id)
-	t, ok := a.Store.Target(j.TargetID)
-	if !ok || !t.Enabled {
-		return errors.New("NAS target is disabled or missing")
-	}
-	targetLock := a.Store.targetLock(t.ID)
-	targetLock.Lock()
-	defer targetLock.Unlock()
-	if err := a.Store.Check(id); err != nil {
-		return err
-	}
-	point, err := a.ResolveTarget(t)
-	if err != nil {
-		return err
-	}
-	destination, err := ensureDirs(point, j.Folder)
-	if err != nil {
-		return err
-	}
-	m, err := a.Store.Manifest(id)
-	if err != nil {
-		return err
-	}
-	check := func() error { return a.Store.Check(id) }
-	final := filepath.Join(destination, m.Name)
-	marker := filepath.Join(final, ".nas-relay-incomplete.json")
-	var ownership struct {
-		ID string `json:"id"`
-	}
-	own := readJSON(marker, &ownership) == nil && ownership.ID == id
-	exists := false
-	if _, err := os.Lstat(final); err == nil {
-		exists = true
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	stageRoot, err := internalDirectory(destination, ".nas-relay-staging")
-	if err != nil {
-		return err
-	}
-	stage, err := ensureDirs(stageRoot, id+"/payload")
-	if err != nil {
-		return err
-	}
-	if exists && !own {
-		meter := newMeter(a.Store, id, "checking_existing", j.Bytes, 0)
-		_ = meter.flush(true)
-		if err = verifyTree(destination, m, check, meter.add, true, false); err != nil {
-			if errors.Is(err, ErrPaused) || errors.Is(err, ErrCancelled) {
-				return err
-			}
-			return conflictError{err.Error()}
-		}
-	} else {
-		verifyMeter := newMeter(a.Store, id, "checking_relay", j.Bytes, 0)
-		_ = verifyMeter.flush(true)
-		if err = verifyTree(a.Store.jobPath(id, "payload"), m, check, verifyMeter.add, false, false); err != nil {
-			if errors.Is(err, ErrPaused) || errors.Is(err, ErrCancelled) {
-				return err
-			}
-			return payloadError{"relay payload is damaged: " + err.Error()}
-		}
-		var initial int64
-		for _, e := range m.Entries {
-			if e.Type == "file" {
-				if info, err := os.Lstat(filepath.Join(stage, e.Path)); err == nil && info.Mode().IsRegular() && info.Size() <= e.Size {
-					initial += info.Size()
-				}
-			}
-		}
-		meter := newMeter(a.Store, id, "copying", j.Bytes, initial)
-		if err = meter.flush(true); err != nil {
-			return err
-		}
-		for _, e := range m.Entries {
-			if err = check(); err != nil {
-				return err
-			}
-			if e.Type == "dir" {
-				if _, err = ensureDirs(stage, e.Path); err != nil {
-					return err
-				}
-				continue
-			}
-			if _, err = ensureDirs(stage, filepath.ToSlash(filepath.Dir(e.Path))); err != nil {
-				return err
-			}
-			if err = copyResume(a.Store.jobPath(id, "payload", e.Path), filepath.Join(stage, e.Path), e, check, meter.add); err != nil {
-				return err
-			}
-		}
-		meter = newMeter(a.Store, id, "verifying_nas", j.Bytes, 0)
-		if err = meter.flush(true); err != nil {
-			return err
-		}
-		if err = verifyTree(stage, m, check, meter.add, true, false); err != nil {
-			if !errors.Is(err, ErrPaused) && !errors.Is(err, ErrCancelled) {
-				_ = os.RemoveAll(stage)
-			}
-			return err
-		}
-		meter = newMeter(a.Store, id, "publishing", j.Bytes, 0)
-		if err = meter.flush(true); err != nil {
-			return err
-		}
-		if err = publishTree(stage, destination, m, check, meter.add); err != nil {
-			return err
-		}
-	}
-	if err = check(); err != nil {
-		return err
-	}
-	receipts, err := internalDirectory(destination, ".nas-relay-receipts")
-	if err != nil {
-		return err
-	}
-	receipt := map[string]any{"id": id, "owner": j.Owner, "manifest_sha256": j.ManifestSHA, "verified_at": time.Now().UTC(), "manifest": m}
-	if err = atomicJSON(filepath.Join(receipts, id+".json"), receipt); err != nil {
-		return err
-	}
-	if err = atomicJSON(filepath.Join(a.Store.Root, "receipts", id+".json"), receipt); err != nil {
-		return err
-	}
-	if err = a.Store.Update(id, func(v *Job) error {
-		if v.Action == "paused" {
-			return ErrPaused
-		}
-		if v.Action == "cancelled" {
-			return ErrCancelled
-		}
-		v.Stage = "completed"
-		v.Done = v.Bytes
-		v.Total = v.Bytes
-		v.Speed = 0
-		v.ETA = nil
-		v.Error = ""
-		return nil
-	}); err != nil {
-		return err
-	}
-	// A completion record must be durable before removing the only relay payload.
-	return a.cleanupFinished(id, destination, false)
-}
 func copyResume(source, dest string, e Entry, check func() error, progress func(int64)) error {
 	src, err := os.Open(source)
 	if err != nil {
@@ -479,6 +341,9 @@ func copyResume(source, dest string, e Entry, check func() error, progress func(
 	return nil
 }
 func publishTree(stage, destination string, m Manifest, check func() error, progress func(int64)) error {
+	return publishTreeFrom(filepath.Join(stage, m.Name), destination, m, check, progress)
+}
+func publishTreeFrom(dataRoot, destination string, m Manifest, check func() error, progress func(int64)) error {
 	root := filepath.Join(destination, m.Name)
 	var top Entry
 	for _, e := range m.Entries {
@@ -491,7 +356,7 @@ func publishTree(stage, destination string, m Manifest, check func() error, prog
 		if err := check(); err != nil {
 			return err
 		}
-		if err := os.Link(filepath.Join(stage, m.Name), root); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := os.Link(dataRoot, root); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
 		if err := verifyTree(destination, m, check, progress, true, false); err != nil {
@@ -533,7 +398,7 @@ func publishTree(stage, destination string, m Manifest, check func() error, prog
 			}
 			continue
 		}
-		if err := os.Link(filepath.Join(stage, e.Path), filepath.Join(destination, e.Path)); err != nil {
+		if err := os.Link(dataPath(dataRoot, m.Name, e.Path), filepath.Join(destination, e.Path)); err != nil {
 			if !os.IsExist(err) {
 				return err
 			}
@@ -545,9 +410,7 @@ func publishTree(stage, destination string, m Manifest, check func() error, prog
 	if err := verifyTree(destination, m, check, progress, true, true); err != nil {
 		return err
 	}
-	if err := os.Remove(marker); err != nil {
-		return err
-	}
+	// Keep ownership until the completion receipt is durable; pause/restart can safely resume.
 	if err := syncDir(root); err != nil {
 		return err
 	}
@@ -582,6 +445,12 @@ func (a *Server) cleanupFinished(id, destination string, recheck bool) error {
 	if !ok {
 		return os.ErrNotExist
 	}
+	if j.Stage == "failed" || j.Stage == "conflict" {
+		if err := a.cleanupNASWork(id, destination); err != nil {
+			return err
+		}
+		return a.Store.Update(id, func(v *Job) error { v.NASClean = true; v.CleanupError = ""; return nil })
+	}
 	if j.Stage != "completed" && j.Stage != "cancelled" {
 		return nil
 	}
@@ -589,7 +458,7 @@ func (a *Server) cleanupFinished(id, destination string, recheck bool) error {
 		if err := os.RemoveAll(a.Store.jobPath(id, "payload")); err != nil {
 			return err
 		}
-		return a.Store.Update(id, func(v *Job) error { v.RelayClean = true; v.NASClean = true; return nil })
+		return a.Store.Update(id, func(v *Job) error { v.RelayClean = true; v.NASClean = true; v.CleanupError = ""; return nil })
 	}
 	if destination == "" {
 		t, ok := a.Store.Target(j.TargetID)
@@ -605,10 +474,16 @@ func (a *Server) cleanupFinished(id, destination string, recheck bool) error {
 			return err
 		}
 	}
+	if err := a.cleanupNASWork(id, destination); err != nil {
+		return err
+	}
 	if recheck && j.Stage == "completed" && !j.RelayClean {
 		m, err := a.Store.Manifest(id)
 		if err != nil {
 			return err
+		}
+		if j.ArchiveName != "" {
+			m = renameManifest(m, j.ArchiveName)
 		}
 		if err = verifyTree(destination, m, nil, nil, true, false); err != nil {
 			return err
@@ -636,5 +511,11 @@ func (a *Server) cleanupFinished(id, destination string, recheck bool) error {
 	if err := os.RemoveAll(a.Store.jobPath(id, "payload")); err != nil {
 		return err
 	}
-	return a.Store.Update(id, func(v *Job) error { v.RelayClean = true; v.NASClean = true; v.Error = ""; return nil })
+	return a.Store.Update(id, func(v *Job) error {
+		v.RelayClean = true
+		v.NASClean = true
+		v.Error = ""
+		v.CleanupError = ""
+		return nil
+	})
 }

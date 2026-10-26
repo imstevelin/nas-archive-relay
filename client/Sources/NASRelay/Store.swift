@@ -46,6 +46,7 @@ final class Store: ObservableObject {
   private var controlling = Set<String>()
   private var lastProbe = Date.distantPast
   private var poller: Task<Void, Never>?
+  private var selectionPanel: NSOpenPanel?
   let root: URL
 
   init() {
@@ -72,7 +73,8 @@ final class Store: ObservableObject {
       }.sorted { $0.created > $1.created }
       for i in tasks.indices
       where !tasks[i].accepted
-        && ["preparing", "uploading", "checking_source"].contains(tasks[i].state)
+        && ["preparing", "uploading", "checking_source", "checking_destination"].contains(
+          tasks[i].state)
       {
         tasks[i].state = "queued"
         tasks[i].speed = 0
@@ -186,7 +188,7 @@ final class Store: ObservableObject {
                       for _ in 0..<3 {
                         let start = ContinuousClock.now
                         let ping: Ping = try await api.get(
-                          "v1/ping", endpoint: ep, as: Ping.self, timeout: 3)
+                          "v1/ping", endpoint: ep, as: Ping.self, timeout: 8)
                         guard ping.server_id == profile.id && ping.client_id == profile.clientID
                         else { throw RelayFailure("伺服器身分不符") }
                         let elapsed = start.duration(to: .now)
@@ -204,7 +206,7 @@ final class Store: ObservableObject {
               }
               guard let fastest = samples.min(by: { $0.1 < $1.1 }) else {
                 if let first = profile.endpoints.first {
-                  _ = try await api.get("v1/ping", endpoint: first, as: Ping.self, timeout: 3)
+                  _ = try await api.get("v1/ping", endpoint: first, as: Ping.self, timeout: 8)
                 }
                 throw RelayFailure("無法連接此中繼的任何位址")
               }
@@ -305,20 +307,38 @@ final class Store: ObservableObject {
     }
   }
   func choose() {
+    guard selectionPanel == nil, let server = activeServer else { return }
+    let chosenTarget = targetID(server)
+    let chosenFolder = folder(server)
     let panel = NSOpenPanel()
+    selectionPanel = panel
     panel.canChooseDirectories = true
     panel.canChooseFiles = true
     panel.allowsMultipleSelection = true
     panel.prompt = "加入歸檔"
-    if panel.runModal() == .OK { add(panel.urls) }
+    let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+      guard let self else { return }
+      self.selectionPanel = nil
+      if response == .OK {
+        self.add(panel.urls, server: server, target: chosenTarget, folder: chosenFolder)
+      }
+    }
+    if let window = NSApp.keyWindow {
+      panel.beginSheetModal(for: window, completionHandler: completion)
+    } else {
+      panel.begin(completionHandler: completion)
+    }
   }
-  func add(_ urls: [URL]) {
-    guard let server = activeServer, let h = health[server] else {
+  func add(
+    _ urls: [URL], server chosenServer: String? = nil, target chosenTarget: String? = nil,
+    folder chosenFolder: String? = nil
+  ) {
+    guard let server = chosenServer ?? activeServer, let h = health[server] else {
       error = "請先連接可用的中繼伺服器"
       return
     }
-    let target = targetID(server)
-    let subfolder = folder(server)
+    let target = chosenTarget ?? targetID(server)
+    let subfolder = chosenFolder ?? folder(server)
     guard h.targets.contains(where: { $0.id == target && $0.enabled }) else {
       error = "請先設定此中繼的 NAS 目標"
       return
@@ -397,19 +417,38 @@ final class Store: ObservableObject {
     }
     let api = try api(item.serverID)
     let endpoint = health.endpoint
-    if let remote: ServerJob = try? await api.get(
-      "v1/jobs/" + id, endpoint: endpoint, as: ServerJob.self), remote.accepted
-    {
-      update(id) { t in
-        t.accepted = true
-        t.remote = remote
-        t.state = remote.stage == "completed" ? "completed" : "handed_off"
+    var existing: ServerJob?
+    do {
+      existing = try await api.get("v1/jobs/" + id, endpoint: endpoint, as: ServerJob.self)
+    } catch { if (error as? RelayFailure)?.status != 404 { throw error } }
+    if let remote = existing, remote.accepted {
+      update(id) {
+        $0.accepted = true
+        $0.remote = remote
+        $0.state = remote.stage == "completed" ? "completed" : "handed_off"
       }
       return
     }
+    if existing == nil && item.duplicateChoice == nil {
+      update(id) { $0.state = "checking_destination" }
+      let body = try JSONSerialization.data(withJSONObject: [
+        "name": item.name, "target_id": item.targetID, "folder": item.folder,
+      ])
+      // This early check is advisory. An unavailable NAS must not prevent relay handoff.
+      if let reply: PreflightReply = try? await api.send(
+        "v1/preflight", body: body, endpoint: endpoint, as: PreflightReply.self, timeout: 5),
+        reply.exists
+      {
+        update(id) {
+          $0.state = "awaiting_duplicate_local"
+          $0.message = nil
+        }
+        return
+      }
+    }
     let url = try source(item)
     let manifestURL = directory(id).appendingPathComponent("manifest.json")
-    let manifest: Manifest
+    var manifest: Manifest
     update(id) {
       $0.state = "preparing"
       $0.message = nil
@@ -446,6 +485,10 @@ final class Store: ObservableObject {
       try save(manifest, to: manifestURL)
     }
     try Task.checkCancellation()
+    if existing == nil {
+      manifest.collision_policy = item.duplicateChoice
+      try save(manifest, to: manifestURL)
+    }
     update(id) { $0.bytes = manifest.bytes }
     var remote: ServerJob = try await api.send(
       "v1/jobs", body: JSONEncoder().encode(manifest), endpoint: endpoint, as: ServerJob.self)
@@ -595,6 +638,24 @@ final class Store: ObservableObject {
       startPending()
     }
   }
+  func resolveDuplicate(_ id: String, keepBoth: Bool) {
+    if tasks.first(where: { $0.id == id })?.state == "awaiting_duplicate_local" {
+      update(id) {
+        $0.duplicateChoice = keepBoth ? "keep-both" : "use-existing"
+        $0.state = "queued"
+        $0.message = nil
+      }
+      startPending()
+      return
+    }
+    let action = keepBoth ? "keep-both" : "use-existing"
+    update(id) {
+      $0.pendingAction = action
+      $0.state = "resuming"
+      $0.message = nil
+    }
+    Task { await control(id, action) }
+  }
   func cancel(_ id: String) {
     running[id]?.cancel()
     update(id) {
@@ -639,7 +700,12 @@ final class Store: ObservableObject {
         }
       }
     } catch {
-      if (error as? RelayFailure)?.status == 404 {
+      if (error as? RelayFailure)?.status == 409 {
+        update(id) {
+          $0.pendingAction = nil
+          $0.message = error.localizedDescription
+        }
+      } else if (error as? RelayFailure)?.status == 404 {
         update(id) {
           guard $0.pendingAction == action else { return }
           $0.pendingAction = nil

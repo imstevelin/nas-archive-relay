@@ -24,3 +24,11 @@ Manifest 具有隨機32位小寫hex `id`、`name`、`target_id`、相對 `folder
 建立同一 ID 與相同 manifest 是冪等操作。GET upload 後從確認 offset 繼續。chunk 僅在 SHA 與 fsync、持久化 offset journal 成功後回覆；斷線未確認區塊會回復到前次 offset。commit 回覆202不等於已交接，必須輪詢直到 `accepted: true`。`completed` 表示最終內容與收據已確認；`relay_clean` / `nas_clean` 表示兩端暫存清理已完成。
 
 一般用戶端只可讀寫自己工作。admin 查詢 `/v1/jobs?all=true` 可列出全部。權限不足403、不可見工作404、狀態或offset衝突409、空間不足507。NAS 故障保留 payload 並重試；來源校驗失敗、同名衝突需要人工處理。
+
+## v0.3 同名內容與 NAS 狀態
+
+`POST /v1/preflight` 傳入 `name`、`target_id`、`folder`，回覆 `exists`。這是不建立檔案的預檢；NAS 不可用時可先交接到中繼，之後仍會再次檢查。NAS 檢查併發上限為2，避免失聯的 hard mount 累積無限等待。
+
+Manifest 可帶 `collision_policy: "use-existing" | "keep-both"`，表示使用者已在上傳前做出選擇。省略時，如果 NAS 已有同名內容，工作進入 `awaiting_duplicate`，必須 POST `use-existing`、`keep-both` 或 `cancel`。普通 resume 不能代替確認。use-existing 只接受完整相同內容，差異會進入 conflict；keep-both 以獨立副本名稱歸檔，`archive_name` 回覆實際名稱。
+
+NAS 暫存位於可見的 `素材名（上傳中）.nasrelay-JOB_ID`、`素材名（校驗中）.nasrelay-JOB_ID` 目錄，ID 隔離多用戶的同名任務。全部內容校驗通過後才建立原名。錯誤或終止清除具有正確任務標記的暫存；中繼的已驗證來源在歸檔完成前保留，終止時才清除。網路失聯導致清理暫時不可行時，狀態保留 pending 並在恢復後重試。
