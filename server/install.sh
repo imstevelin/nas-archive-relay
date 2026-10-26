@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Public release installer. No application data or existing NAS shares are reset.
-VERSION=latest
+INSTALL_VERSION=latest
 PORT=8743
 DATA=/var/lib/nas-archive-relay
 RELAY_NAME="$(hostname) NAS Relay"
@@ -10,21 +10,21 @@ BINARY=""
 ENDPOINTS=()
 while (($#)); do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
+    --version) INSTALL_VERSION="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --data) DATA="$2"; shift 2;;
     --name) RELAY_NAME="$2"; shift 2;;
     --endpoint) ENDPOINTS+=(--endpoint "$2"); shift 2;;
     --binary) BINARY="$2"; shift 2;;
-    -h|--help) echo 'Usage: sudo bash install.sh [--name NAME] [--port 8743] [--endpoint https://HOST:PORT] [--binary PATH] [--version v0.2.0]'; exit 0;;
+    -h|--help) echo 'Usage: sudo bash install.sh [--name NAME] [--port 8743] [--endpoint https://HOST:PORT] [--binary PATH] [--version TAG]'; exit 0;;
     *) echo "Unknown option: $1" >&2; exit 2;;
   esac
 done
 [[ $EUID == 0 ]] || { echo 'Run this installer with sudo.' >&2; exit 1; }
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT>=1024 && PORT<=65535)) || { echo 'Invalid port.' >&2; exit 1; }
 [[ "$DATA" =~ ^/[A-Za-z0-9/._-]+$ && "$DATA" != / && "$DATA" != /var && "$DATA" != /etc && "$DATA" != /usr ]] || { echo 'Use an absolute state path below /var/lib or /srv.' >&2; exit 1; }
-. /etc/os-release
-[[ "$ID" == ubuntu ]] || { echo 'This installer supports Ubuntu Server 22.04 and later.' >&2; exit 1; }
+OS_ID="$(. /etc/os-release; printf %s "$ID")"
+[[ "$OS_ID" == ubuntu ]] || { echo 'This installer supports Ubuntu Server 22.04 and later.' >&2; exit 1; }
 command -v systemctl >/dev/null || { echo 'systemd is required.' >&2; exit 1; }
 exec 9>/run/lock/nas-archive-relay-install.lock
 flock -n 9 || { echo 'Another installer is running.' >&2; exit 1; }
@@ -37,9 +37,9 @@ if [[ -z "$BINARY" ]]; then
   case "$(uname -m)" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo 'Unsupported CPU architecture.' >&2; exit 1;; esac
   REPO="${NAS_RELAY_REPO:-imstevelin/nas-archive-relay}"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
-  if [[ "$VERSION" == latest ]]; then BASE="https://github.com/$REPO/releases/latest/download"; else
-    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-A-Za-z0-9.]+)?$ ]] || { echo 'Invalid version.' >&2; exit 1; }
-    BASE="https://github.com/$REPO/releases/download/$VERSION"
+  if [[ "$INSTALL_VERSION" == latest ]]; then BASE="https://github.com/$REPO/releases/latest/download"; else
+    [[ "$INSTALL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-A-Za-z0-9.]+)?$ ]] || { echo 'Invalid version.' >&2; exit 1; }
+    BASE="https://github.com/$REPO/releases/download/$INSTALL_VERSION"
   fi
   FILE="nas-relay-linux-$ARCH"
   curl --fail --location --proto '=https' --tlsv1.2 "$BASE/$FILE" -o "$TMP/$FILE"
