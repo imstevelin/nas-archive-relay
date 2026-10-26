@@ -173,3 +173,16 @@ func (s *Store) RenewCertificate() error {
 	}
 	return nil
 }
+
+// DefaultDataRoot follows the root-owned installer pointer for custom storage locations.
+func DefaultDataRoot() string { return defaultDataRootFromFile("/etc/nas-archive-relay/data-path") }
+func defaultDataRootFromFile(pointer string) string {
+	b, err := os.ReadFile(pointer)
+	if err == nil {
+		value := strings.TrimSuffix(strings.TrimSuffix(string(b), "\n"), "\r")
+		if filepath.IsAbs(value) && value != "/" && !strings.ContainsAny(value, "\x00\r\n") {
+			return value
+		}
+	}
+	return "/var/lib/nas-archive-relay"
+}

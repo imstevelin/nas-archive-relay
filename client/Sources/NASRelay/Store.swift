@@ -73,8 +73,9 @@ final class Store: ObservableObject {
       }.sorted { $0.created > $1.created }
       for i in tasks.indices
       where !tasks[i].accepted
-        && ["preparing", "uploading", "checking_source", "checking_destination"].contains(
-          tasks[i].state)
+        && ["preparing", "uploading", "checking_source", "checking_destination", "checking_resume"]
+          .contains(
+            tasks[i].state)
       {
         tasks[i].state = "queued"
         tasks[i].speed = 0
@@ -130,20 +131,45 @@ final class Store: ObservableObject {
   func importConnection(_ text: String) throws {
     let info = try ConnectionInfo.parse(text)
     let profile = ServerProfile(info)
-    try CredentialVault.set(info.token, key: profile.credentialKey)
     if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
       guard
-        !tasks.contains(where: { $0.serverID == profile.id && !$0.finished && $0.accepted })
+        !tasks.contains(where: { $0.serverID == profile.id && !$0.finished })
           || profiles[index].clientID == profile.clientID
       else { throw RelayFailure("此中繼仍有目前用戶端的任務，請完成後再改用另一個身分") }
-      apis[profile.id]?.close()
-      apis.removeValue(forKey: profile.id)
+      try CredentialVault.set(info.token, key: profile.credentialKey)
+      invalidateConnection(profile.id)
       profiles[index] = profile
     } else {
+      try CredentialVault.set(info.token, key: profile.credentialKey)
       profiles.append(profile)
     }
     persistProfiles()
     lastProbe = .distantPast
+    Task { await refresh() }
+  }
+  private func invalidateConnection(_ id: String) {
+    for task in tasks where task.serverID == id && running[task.id] != nil && !task.accepted {
+      running[task.id]?.cancel()
+      if !["paused", "cancelling", "cancelled"].contains(task.state) && task.pendingAction == nil {
+        update(task.id) {
+          $0.state = "queued"
+          $0.speed = 0
+          $0.eta = nil
+        }
+      }
+    }
+    apis[id]?.close()
+    apis.removeValue(forKey: id)
+    health.removeValue(forKey: id)
+    connectionErrors.removeValue(forKey: id)
+    lastProbe = .distantPast
+  }
+  func editConnection(_ id: String, name: String, addresses: String) throws {
+    guard let i = profiles.firstIndex(where: { $0.id == id }) else { throw RelayFailure("找不到中繼設定") }
+    let next = try profiles[i].edited(name: name, addresses: addresses)
+    invalidateConnection(id)
+    profiles[i] = next
+    persistProfiles()
     Task { await refresh() }
   }
   func removeProfile(_ id: String) {
@@ -238,6 +264,9 @@ final class Store: ObservableObject {
     if probe { lastProbe = Date() }
     for result in results {
       if let value = result.health {
+        guard
+          profiles.first(where: { $0.id == result.id })?.endpoints.contains(value.endpoint) == true
+        else { continue }
         health[result.id] = value
         connectionErrors.removeValue(forKey: result.id)
         for remote in value.jobs {
@@ -450,7 +479,7 @@ final class Store: ObservableObject {
     let manifestURL = directory(id).appendingPathComponent("manifest.json")
     var manifest: Manifest
     update(id) {
-      $0.state = "preparing"
+      $0.state = item.uploaded > 0 ? "checking_resume" : "preparing"
       $0.message = nil
       $0.preparationDone = 0
     }
@@ -458,7 +487,10 @@ final class Store: ObservableObject {
     let progress: @Sendable (Int64, Int64) -> Void = { [weak self] done, total in
       guard preparingGate.allows(done, total) else { return }
       Task { @MainActor in
-        guard let self, self.tasks.first(where: { $0.id == id })?.state == "preparing" else {
+        guard let self,
+          ["preparing", "checking_resume"].contains(
+            self.tasks.first(where: { $0.id == id })?.state ?? "")
+        else {
           return
         }
         self.update(id) {
@@ -726,6 +758,10 @@ final class Store: ObservableObject {
         return
       }
       do {
+        let target = targetID(server)
+        guard next.targets.contains(where: { $0.id == target && $0.enabled }) else {
+          throw RelayFailure("新中繼未設定預設 NAS")
+        }
         if let job: ServerJob = try? await api(old.serverID).get(
           "v1/jobs/" + id, endpoint: h.endpoint, as: ServerJob.self)
         {
@@ -734,10 +770,6 @@ final class Store: ObservableObject {
           }
           let _: ServerJob = try await api(old.serverID).send(
             "v1/jobs/" + id + "/cancel", endpoint: h.endpoint, as: ServerJob.self)
-        }
-        let target = targetID(server)
-        guard next.targets.contains(where: { $0.id == target && $0.enabled }) else {
-          throw RelayFailure("新中繼未設定預設 NAS")
         }
         update(id) { $0.state = "cancelled" }
         let newID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()

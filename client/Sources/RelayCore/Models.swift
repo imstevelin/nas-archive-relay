@@ -78,6 +78,33 @@ public struct ServerProfile: Codable, Identifiable, Sendable {
     clientID = info.client_id
     role = info.role
   }
+  public func edited(name: String, addresses: String) throws -> ServerProfile {
+    let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !label.isEmpty, label.count <= 160 else { throw RelayFailure("請輸入伺服器顯示名稱") }
+    let port = endpoints.first.flatMap { URL(string: $0)?.port } ?? 8743
+    let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",;"))
+    let values = addresses.components(separatedBy: separators).filter { !$0.isEmpty }
+    var normalized: [String] = []
+    for value in values {
+      let explicitScheme = value.contains("://")
+      guard var u = URLComponents(string: explicitScheme ? value : "https://" + value),
+        u.scheme == "https", let host = u.host, !host.isEmpty,
+        u.user == nil, u.password == nil, u.query == nil, u.fragment == nil,
+        u.path.isEmpty || u.path == "/", u.port == nil || (1...65535).contains(u.port!)
+      else { throw RelayFailure("請輸入 IP 或 HTTPS 根位址，例如 https://192.168.1.20:8743") }
+      if !explicitScheme && u.port == nil { u.port = port }
+      u.path = ""
+      guard let endpoint = u.url?.absoluteString else { throw RelayFailure("伺服器位址不正確") }
+      if !normalized.contains(endpoint) { normalized.append(endpoint) }
+    }
+    guard !normalized.isEmpty, normalized.count <= 16 else {
+      throw RelayFailure("請提供 1 至 16 個連線位址，每行一個")
+    }
+    var result = self
+    result.name = label
+    result.endpoints = normalized
+    return result
+  }
   public var credentialKey: String { id + "." + clientID }
 }
 
@@ -225,6 +252,11 @@ public struct LocalTask: Codable, Identifiable, Sendable {
     self.serverID = serverID
     self.targetID = targetID
     self.folder = folder
+  }
+  public var uploadFraction: Double {
+    if accepted { return 1 }
+    guard bytes > 0 else { return 0 }
+    return min(1, max(0, Double(uploaded) / Double(bytes)))
   }
   public var finished: Bool {
     if let remote, ["completed", "cancelled"].contains(remote.stage) {

@@ -113,4 +113,41 @@ final class RelayCoreTests: XCTestCase {
     XCTAssertFalse(Routing.safeFolder("Footage/.NAS-RELAY-INCOMPLETE.JSON"))
     XCTAssertFalse(Routing.safeFolder(".RELAY-PARTIAL"))
   }
+  func testEditingConnectionKeepsIdentityAndStorageChoices() throws {
+    var profile = ServerProfile(try info())
+    profile.preferredTarget = "target"
+    profile.preferredFolder = "Podcast"
+    let updated = try profile.edited(
+      name: "Office Relay", addresses: "192.168.1.20\nhttps://relay.local:9443\n192.168.1.20")
+    XCTAssertEqual(updated.endpoints, ["https://192.168.1.20:8743", "https://relay.local:9443"])
+    XCTAssertEqual(updated.id, profile.id)
+    XCTAssertEqual(updated.clientID, profile.clientID)
+    XCTAssertEqual(updated.fingerprint, profile.fingerprint)
+    XCTAssertEqual(updated.certificate, profile.certificate)
+    XCTAssertEqual(updated.preferredTarget, "target")
+    XCTAssertEqual(updated.preferredFolder, "Podcast")
+    for address in [
+      "http://relay.local", "https://user:pass@relay.local", "https://relay.local/private",
+      "https://relay.local?token=x",
+    ] {
+      XCTAssertThrowsError(try profile.edited(name: "Relay", addresses: address))
+    }
+  }
+  func testResumePreparationKeepsConfirmedProgressAfterRestart() throws {
+    var task = LocalTask(
+      id: "job", name: "Footage", source: "/tmp/Footage", bookmark: nil, serverID: "relay",
+      targetID: "nas", folder: "")
+    task.bytes = 1000
+    task.uploaded = 110
+    task.state = "paused"
+    let saved = try JSONEncoder().encode(task)
+    var restored = try JSONDecoder().decode(LocalTask.self, from: saved)
+    for state in ["resuming", "checking_resume", "preparing", "checking_source", "uploading"] {
+      restored.state = state
+      restored.preparationDone = 0
+      XCTAssertEqual(restored.uploadFraction, 0.11, accuracy: 0.0001)
+    }
+    restored.accepted = true
+    XCTAssertEqual(restored.uploadFraction, 1)
+  }
 }

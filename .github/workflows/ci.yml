@@ -16,6 +16,9 @@ jobs:
       - run: go vet ./...
         working-directory: server
       - run: bash -n server/install.sh scripts/*.sh
+      - run: go build -o "$RUNNER_TEMP/nas-relay-host" ./cmd/nas-relay
+        working-directory: server
+      - run: python3 server/install_test.py "$RUNNER_TEMP/nas-relay-host"
       - run: bash scripts/build-server.sh
   client:
     runs-on: macos-15
