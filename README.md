@@ -9,15 +9,18 @@
 Ubuntu Server 22.04 以上，amd64 / arm64：
 
 ```sh
-curl -fL https://raw.githubusercontent.com/imstevelin/nas-archive-relay/main/server/install.sh -o install-nas-relay.sh
-sudo bash install-nas-relay.sh --name 'My Relay' --endpoint https://192.168.1.20:8743
+curl -fsSL https://github.com/imstevelin/nas-archive-relay/releases/latest/download/install.sh | sudo bash
 ```
+
+安裝器會互動詢問名稱、埠號與暫存／服務資料位置，列出已掛載的磁碟及偵測到的區網／VPN 端點供選擇；也可輸入自訂目錄或 HTTPS 位址。直接按 Enter 會採用預設值。它不會格式化或自動掛載磁碟。
+
+無人值守安裝可加 `--non-interactive`，搭配 `--name`、`--data`、`--port` 及可重複的 `--endpoint`。重新安裝會保留既有資料位置、憑證與任務；不會把進行中的工作切換到空目錄。
 
 安裝器會下載發行檔並校對 SHA-256，安裝 NFS/SMB 工具、建立獨立的 systemd 服務，顯示管理員連線 URI 與 JSON。可重複指定 `--endpoint` 加入 LAN、VPN 或 DNS 位址。連線資訊包含存取權杖，請私下保管。
 
 ## 使用方式
 
-1. 在 App 按「新增中繼」，貼上服務端連線 URI，或匯入 JSON。可加入多台伺服器。
+1. 在 App 按「加入伺服器」，貼上服務端連線 URI，或匯入 JSON。可加入多台伺服器。
 2. 開啟「管理伺服器」，新增 SMB 或 NFS 目標，測試讀寫與校驗，設定預設歸檔資料夾。
 3. 選擇或拖入素材。App 顯示 Mac→中繼、中繼→NAS 的階段、速度與預估時間。只有出現「可帶走 Mac」才代表完整交接成功。
 4. 每項任務可暫停、繼續、終止。網路恢復後會從已確認的區塊續傳。
@@ -54,3 +57,5 @@ bash scripts/build-server.sh
 服務端不需要 Python、Node 或 Docker；Mac App 不需要外部 rsync。CI 在 Linux 與 macOS 分別執行測試及建置。
 
 [介面設計](docs/DESIGN.md) · [維護與安全](docs/OPERATIONS.md) · [API](docs/API.md) · [驗證紀錄](docs/VALIDATION.md)
+
+已加入的伺服器可從「伺服器設定 → 連線設定」修改顯示名稱與 IP／HTTPS 位址。修改位址不會更換用戶端身分或清除任務；TLS 憑證檢查仍會保留。關閉視窗後可點 Dock 圖示，或從選單選擇「顯示歸檔視窗」（⌘1）重新開啟。

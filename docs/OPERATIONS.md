@@ -30,3 +30,14 @@ NFS 採用 hard mount。若 NAS 無回應，核心 I/O 可能等待網路恢復�
 TLS 憑證有效期一年，符合 macOS 的伺服器憑證期限檢查。維護時可停止服務，執行 `sudo nas-relay certificate-renew`，再啟動服務。憑證更新後，舊指紋將被 App 拒絕，請以新連線資訊重新匯入；既有 token 與工作不會刪除。請在到期前安排維護。
 
 App 允許使用者指定採用私有自簽憑證的主機，因此在 Info.plist 停用系統預設 ATS 信任限制，改由專用 RelayAPI 強制 HTTPS、TLS 1.3、匯入憑證的精確 SHA-256 指紋、SAN 主機與有效期檢查；不使用系統全域憑證信任、不接受 HTTP 或重新導向。SMB 採用 cache=none、actimeo=0、closetimeo=0、nolease，避免部分 CIFS 核心在 hard link 發布後重用舊 handle 而回傳 EINVAL，並確保校驗重新讀取 NAS。
+
+
+## 互動安裝與儲存位置（v0.4）
+
+單行命令透過 `/dev/tty` 互動，即使腳本經由 pipe 執行，也能選擇設定。新安裝可選預設目錄、已掛載磁碟的專用子目錄，或自訂絕對目錄（含空白與中文）；此位置同時保存暫存、設定、憑證與任務紀錄。請使用持久儲存，並先掛載需要的磁碟；安裝器不會格式化磁碟或使用含有其他資料的非空目錄。
+
+systemd 記錄儲存位置所屬掛載點，並加上 RequiresMountsFor / ConditionPathIsMountPoint，避免預期的磁碟未掛載時直接寫到裸目錄。`/etc/nas-archive-relay/data-path` 記錄服務資料位置，CLI 預設會讀取它，所以自訂位置不必每次再加 --data。升級會保留資料與現有端點；搬移進行中工作不在安裝器內自動執行。
+
+自動化部署使用 `--non-interactive`；也可用 `--interactive` 明確要求終端機互動。`nas-relay discover --port 8743` 列出系統偵測到的可用端點，`nas-relay info --field endpoints` 列出已設定端點。
+
+Mac 編輯位址時保留既有憑證釘選。新 IP 或 DNS 必須符合伺服器憑證；如果伺服器更新憑證，可重新匯入更新的連線資訊。尚有未完成任務時不能改成另一個用戶端身分。

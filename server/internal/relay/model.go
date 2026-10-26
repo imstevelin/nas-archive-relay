@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const Version = "0.3.1"
+const Version = "0.4.0"
 const ChunkSize int64 = 8 << 20
 
 var idPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)

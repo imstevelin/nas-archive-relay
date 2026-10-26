@@ -26,7 +26,7 @@ func phase(_ value: String) -> String {
   [
     "checking_destination": "檢查歸檔位置", "awaiting_duplicate_local": "NAS 已有同名項目，請選擇處理方式",
     "awaiting_duplicate": "NAS 已有同名項目，請選擇處理方式", "queued": "等待歸檔", "receiving": "等待素材上傳",
-    "preparing": "建立 SHA-256 清單", "uploading": "傳送素材",
+    "checking_resume": "確認素材與續傳位置", "preparing": "建立 SHA-256 清單", "uploading": "傳送素材",
     "checking_source": "確認原始素材", "verifying_receive": "中繼接收校驗", "handed_off": "已完整交接",
     "paused": "已暫停", "pausing": "正在暫停", "resuming": "正在恢復", "copying": "上傳 NAS",
     "checking_relay": "檢查中繼內容", "checking_existing": "比對 NAS 既有內容", "verifying_nas": "校驗 NAS 內容",
@@ -74,6 +74,47 @@ struct ImportView: View {
           text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
       }
     }.padding(24).frame(width: 570)
+  }
+}
+struct ConnectionEditor: View {
+  @ObservedObject var store: Store
+  let profile: ServerProfile
+  @Environment(\.dismiss) var dismiss
+  @State private var name = ""
+  @State private var addresses = ""
+  @State private var error: String?
+  @State private var importing = false
+  var body: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      Text("編輯中繼連線").font(.title2.bold())
+      TextField("顯示名稱", text: $name)
+      Text("連線 IP 或 HTTPS 位址（每行一個）").font(.headline)
+      TextEditor(text: $addresses).font(.system(.body, design: .monospaced)).frame(height: 110)
+        .padding(8).overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
+      Text("直接輸入 IP 會沿用目前服務埠號。可在離線時儲存；連線仍會檢查原本的憑證與主機名稱。").font(.caption).foregroundStyle(.secondary)
+      DisclosureGroup("更新憑證或用戶端身分") {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("如果新位址不在憑證內，請向服務端取得更新的連線資訊。仍有任務時，可更新原身分的位址與憑證，不能改成另一個用戶端身分。").font(.caption)
+            .foregroundStyle(.secondary)
+          Button("重新匯入連線資訊…") { importing = true }
+        }.padding(.top, 8)
+      }
+      if let error { Text(error).foregroundStyle(.red).font(.callout) }
+      HStack {
+        Spacer()
+        Button("取消") { dismiss() }
+        Button("儲存") {
+          do {
+            try store.editConnection(profile.id, name: name, addresses: addresses)
+            dismiss()
+          } catch { self.error = error.localizedDescription }
+        }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+      }
+    }.padding(24).frame(width: 560).onAppear {
+      name = profile.name
+      addresses = profile.endpoints.joined(separator: "\n")
+    }
+    .sheet(isPresented: $importing) { ImportView(store: store) }
   }
 }
 struct TargetEditor: View {
@@ -155,6 +196,7 @@ struct ServerManager: View {
   @State private var inviteRole = "client"
   @State private var invitation: String?
   @State private var deleting: Target?
+  @State private var editingConnection = false
   var profile: ServerProfile? { store.profiles.first { $0.id == server } }
   var info: ServerHealth? { store.health[server] }
   var canManage: Bool { profile?.role == "admin" }
@@ -167,6 +209,7 @@ struct ServerManager: View {
             .secondary)
         }
         Spacer()
+        Button("連線設定…") { editingConnection = true }
         Button("完成") { dismiss() }
       }
       if let info {
@@ -270,6 +313,9 @@ struct ServerManager: View {
       defaultTarget = info?.info.default_target ?? ""
       defaultFolder = info?.info.default_folder ?? ""
     }
+    .sheet(isPresented: $editingConnection) {
+      if let profile { ConnectionEditor(store: store, profile: profile) }
+    }
     .sheet(item: $edit) { TargetEditor(store: store, server: server, target: $0) }.sheet(
       isPresented: $add
     ) { TargetEditor(store: store, server: server, target: Target()) }
@@ -331,11 +377,7 @@ struct TaskRow: View {
   var remote: ServerJob? { task.remote }
   var paused: Bool { task.state == "paused" || remote?.action == "paused" }
   var completed: Bool { remote?.stage == "completed" }
-  var localProgress: Double {
-    if task.accepted { return 1 }
-    if task.state == "preparing" { return 0 }
-    return task.bytes > 0 ? Double(task.uploaded) / Double(task.bytes) : 0
-  }
+  var localProgress: Double { task.uploadFraction }
   var nasProgress: Double {
     guard let remote, remote.accepted else { return 0 }
     if ["verifying_nas", "publishing", "completed"].contains(remote.stage) { return 1 }
@@ -386,15 +428,16 @@ struct TaskRow: View {
           } label: {
             Label("終止", systemImage: "stop.fill")
           }.help("終止任務")
-          if paused && !task.accepted {
+          if paused && !task.accepted && store.profiles.contains(where: { $0.id != task.serverID })
+          {
             Menu {
               ForEach(store.profiles.filter { $0.id != task.serverID }) { profile in
                 Button(profile.name) { store.reroute(task.id, to: profile.id) }.disabled(
                   store.health[profile.id] == nil)
               }
             } label: {
-              Image(systemName: "arrow.triangle.swap")
-            }.menuStyle(.borderlessButton).fixedSize().frame(width: 32).help("切換到其他中繼")
+              Label("更換中繼", systemImage: "arrow.triangle.swap")
+            }.menuStyle(.borderlessButton).fixedSize().help("使用另一台中繼重新傳送素材")
           }
         }
       }
@@ -733,20 +776,34 @@ struct MainView: View {
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   weak var store: Store?
+  var showMainWindow: (() -> Void)?
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
   func applicationWillTerminate(_ notification: Notification) { store?.stop() }
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-    if !hasVisibleWindows { sender.windows.first?.makeKeyAndOrderFront(nil) }
-    return true
+    if !hasVisibleWindows { showMainWindow?() }
+    sender.activate(ignoringOtherApps: true)
+    return false
+  }
+}
+struct MainWindowContent: View {
+  @ObservedObject var store: Store
+  let delegate: AppDelegate
+  @Environment(\.openWindow) private var openWindow
+  var body: some View {
+    MainView(store: store).onAppear {
+      delegate.store = store
+      delegate.showMainWindow = { openWindow(id: "main") }
+    }
   }
 }
 @main struct NASRelayApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
   @StateObject private var store = Store()
   var body: some Scene {
-    WindowGroup("NAS Relay") { MainView(store: store).onAppear { delegate.store = store } }
+    Window("NAS Relay", id: "main") { MainWindowContent(store: store, delegate: delegate) }
       .defaultSize(width: 1120, height: 800).commands {
         CommandGroup(after: .newItem) {
+          Button("顯示歸檔視窗") { delegate.showMainWindow?() }.keyboardShortcut("1")
           Button("加入素材…") { store.choose() }.keyboardShortcut("o")
           Button("重新整理連線") { Task { await store.refresh() } }.keyboardShortcut("r")
         }

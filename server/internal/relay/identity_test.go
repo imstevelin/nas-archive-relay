@@ -63,3 +63,18 @@ func TestFailedTargetEditRestoresSMBCredentials(t *testing.T) {
 		t.Fatal("credentials not restored", err)
 	}
 }
+
+func TestCustomDataRootPointer(t *testing.T) {
+	pointer := filepath.Join(t.TempDir(), "data-path")
+	value := filepath.Join(t.TempDir(), "我的 暫存 ")
+	if err := os.WriteFile(pointer, []byte(value+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultDataRootFromFile(pointer); got != value {
+		t.Fatalf("got %q", got)
+	}
+	_ = os.WriteFile(pointer, []byte("/\n"), 0600)
+	if got := defaultDataRootFromFile(pointer); got != "/var/lib/nas-archive-relay" {
+		t.Fatal(got)
+	}
+}

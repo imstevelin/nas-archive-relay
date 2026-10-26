@@ -36,7 +36,7 @@ func main() {
 		fmt.Println(relay.Version)
 	case "init":
 		f := flag.NewFlagSet("init", flag.ExitOnError)
-		data := f.String("data", "/var/lib/nas-archive-relay", "state directory")
+		data := f.String("data", relay.DefaultDataRoot(), "state directory")
 		name := f.String("name", "NAS Relay", "server display name")
 		port := f.String("port", "8743", "API port")
 		var addresses endpoints
@@ -59,26 +59,49 @@ func main() {
 		printJSON(c)
 	case "certificate-renew":
 		f := flag.NewFlagSet("certificate-renew", flag.ExitOnError)
-		data := f.String("data", "/var/lib/nas-archive-relay", "state directory")
+		data := f.String("data", relay.DefaultDataRoot(), "state directory")
 		_ = f.Parse(os.Args[2:])
 		s, err := relay.Open(*data)
 		fail(err)
 		fail(s.RenewCertificate())
 		fmt.Println("Certificate renewed. Restart the service and import updated connection information on each client.")
+	case "discover":
+		f := flag.NewFlagSet("discover", flag.ExitOnError)
+		port := f.String("port", "8743", "API port")
+		_ = f.Parse(os.Args[2:])
+		for _, ep := range relay.AutoEndpoints(*port) {
+			fmt.Println(ep)
+		}
 	case "info":
 		f := flag.NewFlagSet("info", flag.ExitOnError)
-		data := f.String("data", "/var/lib/nas-archive-relay", "state directory")
+		data := f.String("data", relay.DefaultDataRoot(), "state directory")
+		field := f.String("field", "", "name, endpoints, or data")
 		_ = f.Parse(os.Args[2:])
 		s, err := relay.Open(*data)
 		fail(err)
 		c := s.Snapshot()
+		if *field != "" {
+			switch *field {
+			case "name":
+				fmt.Println(c.Name)
+			case "endpoints":
+				for _, ep := range c.Endpoints {
+					fmt.Println(ep)
+				}
+			case "data":
+				fmt.Println(s.Root)
+			default:
+				log.Fatal("unknown info field")
+			}
+			return
+		}
 		printJSON(map[string]any{"server_id": c.ID, "name": c.Name, "endpoints": c.Endpoints, "version": relay.Version})
 	case "client":
 		if len(os.Args) < 3 {
 			log.Fatal("Usage: nas-relay client add|list|revoke")
 		}
 		f := flag.NewFlagSet("client", flag.ExitOnError)
-		data := f.String("data", "/var/lib/nas-archive-relay", "state directory")
+		data := f.String("data", relay.DefaultDataRoot(), "state directory")
 		name := f.String("name", "New client", "client name")
 		role := f.String("role", "client", "admin or client")
 		id := f.String("id", "", "client id to revoke")
@@ -115,7 +138,7 @@ func main() {
 		}
 	case "serve":
 		f := flag.NewFlagSet("serve", flag.ExitOnError)
-		data := f.String("data", "/var/lib/nas-archive-relay", "state directory")
+		data := f.String("data", relay.DefaultDataRoot(), "state directory")
 		listen := f.String("listen", ":8743", "HTTPS listen address")
 		_ = f.Parse(os.Args[2:])
 		s, err := relay.Open(*data)
