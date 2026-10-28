@@ -60,10 +60,12 @@ public enum SourceAccess {
   /// A short successful read is not EOF. Accumulate until the requested chunk is full.
   public static func readChunk(at url: URL, offset: Int64, count: Int) throws -> Data {
     do {
-      let input = try FileHandle(forReadingFrom: url)
-      defer { try? input.close() }
-      try input.seek(toOffset: UInt64(offset))
-      return try readExactly(count: count) { try input.read(upToCount: $0) }
+      return try autoreleasepool {
+        let input = try FileHandle(forReadingFrom: url)
+        defer { try? input.close() }
+        try input.seek(toOffset: UInt64(offset))
+        return try readExactly(count: count) { try input.read(upToCount: $0) }
+      }
     } catch is CancellationError { throw CancellationError() } catch let failure as RelayFailure {
       throw failure
     } catch { throw failure(error, url: url) }

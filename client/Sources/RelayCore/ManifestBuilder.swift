@@ -75,15 +75,21 @@ public enum ManifestBuilder {
     defer { try? input.close() }
     var hash = SHA256()
     while true {
-      let data: Data
-      do { data = try input.read(upToCount: 1024 * 1024) ?? Data() } catch {
-        throw SourceAccess.failure(error, url: url)
-      }
-      if data.isEmpty { break }
       try Task.checkCancellation()
-      hash.update(data: data)
-      progress(Int64(data.count))
+      // Foundation's FileHandle buffers are autoreleased. Detached Swift tasks do not
+      // drain a run-loop pool between chunks, so even a streaming loop can retain GBs.
+      let count = try autoreleasepool { () throws -> Int in
+        let data: Data
+        do { data = try input.read(upToCount: 1024 * 1024) ?? Data() } catch {
+          throw SourceAccess.failure(error, url: url)
+        }
+        if !data.isEmpty { hash.update(data: data) }
+        return data.count
+      }
+      if count == 0 { break }
+      progress(Int64(count))
     }
+
     guard before == (try signature(url)) else {
       throw RelayFailure("素材在讀取期間變動：\(url.lastPathComponent)")
     }

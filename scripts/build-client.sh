@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 CONFIGURATION="${CONFIGURATION:-release}"
 ARGS=()
+if [[ -n "${SWIFT_BUILD_SYSTEM:-}" ]]; then ARGS+=(--build-system "$SWIFT_BUILD_SYSTEM"); fi
 if [[ "${UNIVERSAL:-0}" == 1 ]]; then ARGS+=(--arch arm64 --arch x86_64); fi
 swift build --package-path client -c "$CONFIGURATION" "${ARGS[@]}"
 BIN="$(swift build --package-path client -c "$CONFIGURATION" "${ARGS[@]}" --show-bin-path)"
@@ -15,7 +16,7 @@ NAS_RELAY_APP="$APP" python3 - <<'PY'
 import os,plistlib
 from pathlib import Path
 info={'CFBundleIdentifier':'net.imstevelin.NASRelay','CFBundleName':'NAS Relay','CFBundleDisplayName':'NAS Relay',
- 'CFBundleExecutable':'NASRelay','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.4.1','CFBundleVersion':'6',
+ 'CFBundleExecutable':'NASRelay','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.4.2','CFBundleVersion':'7',
  'CFBundleIconFile':'AppIcon','LSMinimumSystemVersion':'14.0','NSHighResolutionCapable':True,
  'NSLocalNetworkUsageDescription':'連接你設定的區域網路中繼伺服器，並選擇延遲最低的連線。',
  'NSDocumentsFolderUsageDescription':'讀取你選取的歸檔素材。','NSDesktopFolderUsageDescription':'讀取你選取的歸檔素材。',
