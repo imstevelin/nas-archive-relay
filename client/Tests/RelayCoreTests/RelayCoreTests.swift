@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -54,6 +55,35 @@ final class RelayCoreTests: XCTestCase {
     XCTAssertThrowsError(try SourceAccess.readChunk(at: source, offset: 2, count: 4))
     let missing = base.appendingPathComponent("disconnected")
     XCTAssertThrowsError(try SourceAccess.check(missing))
+  }
+  func testLargeFileHashingHasBoundedResidentMemory() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let source = root.appendingPathComponent("large.mov")
+    FileManager.default.createFile(atPath: source.path, contents: nil)
+    let file = try FileHandle(forWritingTo: source)
+    let size: Int64 = 512 * 1024 * 1024
+    try file.truncate(atOffset: UInt64(size))
+    try file.close()
+    var usage = rusage()
+    getrusage(RUSAGE_SELF, &usage)
+    let baseline = usage.ru_maxrss
+    let manifest = try ManifestBuilder.build(
+      source: source, id: String(repeating: "c", count: 32),
+      targetID: String(repeating: "d", count: 32), folder: "", progress: { _, _ in })
+    XCTAssertEqual(manifest.bytes, size)
+    try ManifestBuilder.verify(source: source, manifest: manifest, progress: { _, _ in })
+    for offset in stride(from: Int64(0), to: size, by: 8 * 1024 * 1024) {
+      let chunk = try SourceAccess.readChunk(at: source, offset: offset, count: 8 * 1024 * 1024)
+      XCTAssertEqual(chunk.count, 8 * 1024 * 1024)
+    }
+    getrusage(RUSAGE_SELF, &usage)
+    print("Streaming peak memory growth: \(usage.ru_maxrss - baseline) bytes")
+    XCTAssertLessThan(
+      usage.ru_maxrss - baseline, 128 * 1024 * 1024,
+      "Streaming hash must release each chunk before reading the next, including Foundation autoreleased buffers"
+    )
   }
   func info() throws -> ConnectionInfo {
     let cert = try Data(
