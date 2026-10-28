@@ -4,6 +4,57 @@ import XCTest
 @testable import RelayCore
 
 final class RelayCoreTests: XCTestCase {
+  func testOrdinaryBookmarkFollowsMovedExternalStyleSource() throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let old = base.appendingPathComponent("外接硬碟/素材")
+    try FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
+    let bookmark = try old.bookmarkData(
+      options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+    let moved = base.appendingPathComponent("外接硬碟/搬移後素材")
+    try FileManager.default.moveItem(at: old, to: moved)
+    let restored = SourceAccess.resolve(path: old.path, bookmark: bookmark)
+    XCTAssertEqual(restored.resolvingSymlinksInPath().path, moved.resolvingSymlinksInPath().path)
+    XCTAssertNoThrow(try SourceAccess.check(restored))
+  }
+  func testSourceErrorsDistinguishPermissionMissingAndIO() {
+    let url = URL(fileURLWithPath: "/Volumes/Test Drive/素材.mov")
+    let denied = NSError(
+      domain: NSCocoaErrorDomain, code: NSFileReadUnknownError,
+      userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: 1)])
+    XCTAssertTrue(SourceAccess.failure(denied, url: url).localizedDescription.contains("macOS 未允許"))
+    XCTAssertTrue(
+      SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 2), url: url)
+        .localizedDescription.contains("接回硬碟"))
+    let io = SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 5), url: url)
+      .localizedDescription
+    XCTAssertFalse(SourceAccess.failure(denied, url: url).retryable)
+    XCTAssertTrue(
+      SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 2), url: url).retryable)
+    XCTAssertTrue(
+      SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 5), url: url).retryable)
+    XCTAssertTrue(io.contains(url.path))
+    XCTAssertTrue(io.contains("NSPOSIXErrorDomain 5"))
+    XCTAssertFalse(io.contains("找不到"))
+  }
+  func testShortReadsAccumulateAndEOFStillFails() throws {
+    var parts = [Data([1]), Data([2, 3]), Data([4])]
+    XCTAssertEqual(
+      try SourceAccess.readExactly(count: 4) { _ in parts.removeFirst() }, Data([1, 2, 3, 4]))
+    XCTAssertThrowsError(try SourceAccess.readExactly(count: 4) { _ in nil })
+  }
+  func testReadExternalStylePathWithSpacesAndApostrophe() throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let source = base.appendingPathComponent("Travel SSD's 2T/中文素材/相機.mov")
+    try FileManager.default.createDirectory(
+      at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data([0, 1, 2, 3, 4]).write(to: source)
+    XCTAssertEqual(try SourceAccess.readChunk(at: source, offset: 2, count: 3), Data([2, 3, 4]))
+    XCTAssertThrowsError(try SourceAccess.readChunk(at: source, offset: 2, count: 4))
+    let missing = base.appendingPathComponent("disconnected")
+    XCTAssertThrowsError(try SourceAccess.check(missing))
+  }
   func info() throws -> ConnectionInfo {
     let cert = try Data(
       contentsOf: XCTUnwrap(

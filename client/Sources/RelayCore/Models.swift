@@ -268,9 +268,11 @@ public struct LocalTask: Codable, Identifiable, Sendable {
 public struct RelayFailure: Error, LocalizedError, Sendable {
   public let message: String
   public let status: Int
-  public init(_ message: String, status: Int = 0) {
+  public let retryable: Bool
+  public init(_ message: String, status: Int = 0, retryable: Bool = false) {
     self.message = message
     self.status = status
+    self.retryable = retryable
   }
   public var errorDescription: String? { message }
 }

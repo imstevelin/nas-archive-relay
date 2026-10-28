@@ -484,6 +484,10 @@ struct TaskRow: View {
         Label("NAS 暫存尚待清理；中繼會自動重試。", systemImage: "exclamationmark.triangle").font(.caption)
           .foregroundStyle(.orange)
       }
+      if !task.accepted && ["error", "paused", "retry_pending"].contains(task.state) {
+        Button("重新選取來源…") { store.reselectSource(task.id) }
+          .help("重新授權讀取外接硬碟，或指定搬移後的原始素材；既有進度會保留。")
+      }
       if let message = task.message ?? remote?.error, !message.isEmpty {
         Label(issue(message), systemImage: "exclamationmark.triangle").font(.caption)
           .foregroundStyle(

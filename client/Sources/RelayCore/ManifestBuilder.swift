@@ -10,7 +10,10 @@ public enum ManifestBuilder {
     let directory: Bool
   }
   private static func signature(_ url: URL) throws -> Signature {
-    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+    let attrs: [FileAttributeKey: Any]
+    do { attrs = try FileManager.default.attributesOfItem(atPath: url.path) } catch {
+      throw SourceAccess.failure(error, url: url)
+    }
     let kind = attrs[.type] as? FileAttributeType
     guard kind == .typeDirectory || kind == .typeRegular else {
       throw RelayFailure("不支援符號連結或特殊檔案：\(url.lastPathComponent)")
@@ -26,7 +29,8 @@ public enum ManifestBuilder {
     _ = try signature(selected)  // Reject a selected symlink, but allow symlinked parent folders.
     // URL's canonicalizer may keep /var while directory enumeration returns /private/var.
     guard let resolved = selected.path.withCString({ realpath($0, nil) }) else {
-      throw RelayFailure("無法解析素材路徑")
+      throw SourceAccess.failure(
+        NSError(domain: NSPOSIXErrorDomain, code: Int(errno)), url: selected)
     }
     let root = URL(fileURLWithPath: String(cString: resolved))
     free(resolved)
@@ -37,8 +41,8 @@ public enum ManifestBuilder {
       guard
         let enumerator = FileManager.default.enumerator(
           at: root, includingPropertiesForKeys: [], options: [],
-          errorHandler: { _, err in
-            failure = err
+          errorHandler: { url, err in
+            failure = SourceAccess.failure(err, url: url)
             return false
           })
       else { throw RelayFailure("無法讀取資料夾") }
@@ -64,10 +68,18 @@ public enum ManifestBuilder {
   private static func digest(_ url: URL, progress: @Sendable (Int64) -> Void) throws -> String {
     let before = try signature(url)
     guard !before.directory else { throw RelayFailure("來源不是一般檔案") }
-    let input = try FileHandle(forReadingFrom: url)
+    let input: FileHandle
+    do { input = try FileHandle(forReadingFrom: url) } catch {
+      throw SourceAccess.failure(error, url: url)
+    }
     defer { try? input.close() }
     var hash = SHA256()
-    while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
+    while true {
+      let data: Data
+      do { data = try input.read(upToCount: 1024 * 1024) ?? Data() } catch {
+        throw SourceAccess.failure(error, url: url)
+      }
+      if data.isEmpty { break }
       try Task.checkCancellation()
       hash.update(data: data)
       progress(Int64(data.count))
@@ -79,13 +91,17 @@ public enum ManifestBuilder {
   }
   private static func attributes(_ url: URL) throws -> [String: String]? {
     let size = url.path.withCString { listxattr($0, nil, 0, XATTR_NOFOLLOW) }
-    guard size >= 0 else { throw RelayFailure("無法讀取素材擴充屬性") }
+    guard size >= 0 else {
+      throw SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)), url: url)
+    }
     if size == 0 { return nil }
     var names = [CChar](repeating: 0, count: size)
     let actual = url.path.withCString { path in
       names.withUnsafeMutableBufferPointer { listxattr(path, $0.baseAddress, size, XATTR_NOFOLLOW) }
     }
-    guard actual >= 0 else { throw RelayFailure("素材擴充屬性已變動") }
+    guard actual >= 0 else {
+      throw SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)), url: url)
+    }
     let keys = names.map { UInt8(bitPattern: $0) }.split(separator: 0).map {
       String(decoding: $0, as: UTF8.self)
     }
@@ -94,14 +110,20 @@ public enum ManifestBuilder {
       let count = url.path.withCString { p in
         key.withCString { getxattr(p, $0, nil, 0, 0, XATTR_NOFOLLOW) }
       }
-      guard count >= 0, count <= 16 * 1024 * 1024 else { throw RelayFailure("素材擴充屬性過大或無法讀取") }
+      guard count >= 0 else {
+        throw SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)), url: url)
+      }
+      guard count <= 16 * 1024 * 1024 else { throw RelayFailure("素材擴充屬性過大：\(url.path)") }
       var bytes = [UInt8](repeating: 0, count: count)
       let read = url.path.withCString { p in
         key.withCString { k in
           bytes.withUnsafeMutableBytes { getxattr(p, k, $0.baseAddress, count, 0, XATTR_NOFOLLOW) }
         }
       }
-      guard read == count else { throw RelayFailure("素材擴充屬性已變動") }
+      guard read >= 0 else {
+        throw SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)), url: url)
+      }
+      guard read == count else { throw RelayFailure("素材擴充屬性已變動：\(url.path)") }
       result[key] = Data(bytes).base64EncodedString()
     }
     return result.isEmpty ? nil : result
