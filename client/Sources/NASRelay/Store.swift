@@ -391,23 +391,66 @@ final class Store: ObservableObject {
     startPending()
   }
   private func source(_ task: LocalTask) throws -> URL {
-    if let existing = resources[task.id] { return existing }
-    var stale = false
-    let url: URL
-    if let data = task.bookmark {
-      url =
-        (try? URL(
-          resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil,
-          bookmarkDataIsStale: &stale)) ?? URL(fileURLWithPath: task.source)
-    } else {
-      url = URL(fileURLWithPath: task.source)
+    // Re-resolve on each attempt: a cached URL can point at an old /Volumes mount.
+    if let old = resources.removeValue(forKey: task.id) {
+      old.stopAccessingSecurityScopedResource()
     }
+    let url = SourceAccess.resolve(path: task.source, bookmark: task.bookmark)
     if url.startAccessingSecurityScopedResource() { resources[task.id] = url }
-    guard FileManager.default.fileExists(atPath: url.path) else {
-      throw RelayFailure("找不到原始素材，請接回磁碟或重新加入")
+    try SourceAccess.check(url)
+    let bookmark = try? url.bookmarkData(
+      options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+    update(task.id) {
+      $0.source = url.path
+      if let bookmark { $0.bookmark = bookmark }
     }
     return url
   }
+
+  func reselectSource(_ id: String) {
+    guard let item = tasks.first(where: { $0.id == id }), !item.accepted,
+      running[id] == nil, selectionPanel == nil
+    else { return }
+    // Keep automatic retries from starting while the source picker is open.
+    pause(id)
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.message = "重新選取「\(item.name)」的原始素材。已有清單會重新校驗，完成後從中繼已接收的位置繼續。"
+    panel.directoryURL = URL(fileURLWithPath: item.source).deletingLastPathComponent()
+    selectionPanel = panel
+    let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+      guard let self else { return }
+      self.selectionPanel = nil
+      guard response == .OK, let url = panel.url,
+        self.tasks.first(where: { $0.id == id })?.accepted == false
+      else { return }
+      guard url.lastPathComponent == item.name else {
+        self.error = "請選取原本名為「\(item.name)」的檔案或資料夾。"
+        return
+      }
+      if let old = self.resources.removeValue(forKey: id) {
+        old.stopAccessingSecurityScopedResource()
+      }
+      if url.startAccessingSecurityScopedResource() { self.resources[id] = url }
+      let bookmark = try? url.bookmarkData(
+        options: .withSecurityScope,
+        includingResourceValuesForKeys: nil, relativeTo: nil)
+      self.update(id) {
+        $0.source = url.path
+        $0.bookmark = bookmark
+        $0.message = nil
+      }
+      self.resume(id)
+    }
+    if let window = NSApp.keyWindow {
+      panel.beginSheetModal(for: window, completionHandler: completion)
+    } else {
+      panel.begin(completionHandler: completion)
+    }
+  }
+
   private func startPending() {
     guard running.count < 2 else { return }
     for task in tasks.reversed()
@@ -425,7 +468,8 @@ final class Store: ObservableObject {
           {
             let failure = error as? RelayFailure
             let retry =
-              (error is URLError || failure?.status == 500 || failure?.status == 503
+              (error is URLError || failure?.retryable == true || failure?.status == 500
+                || failure?.status == 503
                 || failure?.status == 507)
             self.update(id) { t in
               t.state = retry ? "retry_pending" : "error"
@@ -565,13 +609,7 @@ final class Store: ObservableObject {
         let amount = Int(min(health.info.chunk_size, file.size - offset))
         let readOffset = offset
         let chunk = try await Task.detached {
-          let input = try FileHandle(forReadingFrom: path)
-          defer { try? input.close() }
-          try input.seek(toOffset: UInt64(readOffset))
-          guard let bytes = try input.read(upToCount: amount), bytes.count == amount else {
-            throw RelayFailure("來源檔案變短或無法讀取")
-          }
-          return bytes
+          try SourceAccess.readChunk(at: path, offset: readOffset, count: amount)
         }.value
         try Task.checkCancellation()
         let baseline = completed
