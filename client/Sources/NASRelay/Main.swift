@@ -26,7 +26,8 @@ func phase(_ value: String) -> String {
   [
     "checking_destination": "檢查歸檔位置", "awaiting_duplicate_local": "NAS 已有同名項目，請選擇處理方式",
     "awaiting_duplicate": "NAS 已有同名項目，請選擇處理方式", "queued": "等待歸檔", "receiving": "等待素材上傳",
-    "waiting_source": "等待同一顆硬碟完成校驗", "checking_resume": "確認素材與續傳位置", "preparing": "建立 SHA-256 清單",
+    "resolving_source": "確認來源磁碟", "waiting_source": "等待同一顆硬碟完成校驗", "checking_resume": "確認素材與續傳位置",
+    "preparing": "建立 SHA-256 清單",
     "uploading": "傳送素材",
     "checking_source": "確認原始素材", "verifying_receive": "中繼接收校驗", "handed_off": "已完整交接",
     "paused": "已暫停", "pausing": "正在暫停", "resuming": "正在恢復", "copying": "上傳 NAS",
@@ -398,6 +399,7 @@ struct TaskRow: View {
               + (task.bytes == 0
                 && [
                   "preparing", "checking_destination", "awaiting_duplicate_local", "waiting_source",
+                  "resolving_source",
                 ].contains(
                   task.state)
                 ? "尚未傳送" : bytes(task.bytes))

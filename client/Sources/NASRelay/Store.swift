@@ -15,6 +15,12 @@ private struct PollResult: Sendable {
   let error: String?
 }
 
+private struct ResolvedSource: Sendable {
+  let url: URL
+  let bookmark: Data?
+  let scoped: Bool
+}
+
 private final class ProgressGate: @unchecked Sendable {
   private let lock = NSLock()
   private var last: Double = 0
@@ -75,7 +81,7 @@ final class Store: ObservableObject {
       where !tasks[i].accepted
         && [
           "preparing", "uploading", "checking_source", "checking_destination", "checking_resume",
-          "waiting_source",
+          "waiting_source", "resolving_source",
         ]
         .contains(
           tasks[i].state)
@@ -393,21 +399,42 @@ final class Store: ObservableObject {
     error = nil
     startPending()
   }
-  private func source(_ task: LocalTask) throws -> URL {
-    // Re-resolve on each attempt: a cached URL can point at an old /Volumes mount.
-    if let old = resources.removeValue(forKey: task.id) {
-      old.stopAccessingSecurityScopedResource()
+  private func source(_ task: LocalTask) async throws -> URL {
+    // Keep the selected URL's grant alive until a replacement grant has been acquired.
+    let old = resources[task.id]
+    let work = Task.detached {
+      let url =
+        task.bookmark == nil
+        ? (old ?? URL(fileURLWithPath: task.source))
+        : SourceAccess.resolve(path: task.source, bookmark: task.bookmark)
+      let scoped = url.startAccessingSecurityScopedResource()
+      do {
+        try Task.checkCancellation()
+        try SourceAccess.check(url)
+        let bookmark = try? url.bookmarkData(
+          options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+        try Task.checkCancellation()
+        return ResolvedSource(url: url, bookmark: bookmark, scoped: scoped)
+      } catch {
+        if scoped { url.stopAccessingSecurityScopedResource() }
+        throw error
+      }
     }
-    let url = SourceAccess.resolve(path: task.source, bookmark: task.bookmark)
-    if url.startAccessingSecurityScopedResource() { resources[task.id] = url }
-    try SourceAccess.check(url)
-    let bookmark = try? url.bookmarkData(
-      options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+    let result = try await withTaskCancellationHandler(
+      operation: { try await work.value }, onCancel: { work.cancel() })
+    guard !Task.isCancelled else {
+      if result.scoped { result.url.stopAccessingSecurityScopedResource() }
+      throw CancellationError()
+    }
+    if result.scoped {
+      resources[task.id] = result.url
+      old?.stopAccessingSecurityScopedResource()
+    }
     update(task.id) {
-      $0.source = url.path
-      if let bookmark { $0.bookmark = bookmark }
+      $0.source = result.url.path
+      if let bookmark = result.bookmark { $0.bookmark = bookmark }
     }
-    return url
+    return result.url
   }
 
   func reselectSource(_ id: String) {
@@ -522,7 +549,11 @@ final class Store: ObservableObject {
         return
       }
     }
-    let url = try source(item)
+    update(id) {
+      $0.state = "resolving_source"
+      $0.message = nil
+    }
+    let url = try await source(item)
     let manifestURL = directory(id).appendingPathComponent("manifest.json")
     var manifest: Manifest
     update(id) {
