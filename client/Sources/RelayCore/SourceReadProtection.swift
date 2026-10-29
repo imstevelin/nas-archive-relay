@@ -6,7 +6,7 @@ public enum SourceReadProtection {
   public static let preferenceKey = "protectExternalSourceReads"
   public static let bytesPerSecond: Double = 24 * 1024 * 1024
   public static var enabled: Bool {
-    UserDefaults.standard.object(forKey: preferenceKey) as? Bool ?? true
+    UserDefaults.standard.object(forKey: preferenceKey) as? Bool ?? false
   }
   static func isExternalLocal(internalDisk: Bool?, local: Bool?) -> Bool {
     internalDisk == false && local == true

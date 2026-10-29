@@ -76,6 +76,7 @@ public enum ManifestBuilder {
     }
     defer { try? input.close() }
     try SourceReadProtection.configure(input, url: url, gate: gate)
+    var offset: Int64 = 0
     var hash = SHA256()
     while true {
       try Task.checkCancellation()
@@ -85,12 +86,13 @@ public enum ManifestBuilder {
       let count = try autoreleasepool { () throws -> Int in
         let data: Data
         do { data = try input.read(upToCount: 1024 * 1024) ?? Data() } catch {
-          throw SourceAccess.failure(error, url: url)
+          throw SourceAccess.failure(error, url: url, offset: offset)
         }
         if !data.isEmpty { hash.update(data: data) }
         return data.count
       }
       if count == 0 { break }
+      offset += Int64(count)
       progress(Int64(count))
     }
 

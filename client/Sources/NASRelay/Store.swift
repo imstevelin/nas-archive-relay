@@ -19,6 +19,7 @@ private struct ResolvedSource: Sendable {
   let url: URL
   let bookmark: Data?
   let scoped: Bool
+  let volumeID: String?
 }
 
 private final class ProgressGate: @unchecked Sendable {
@@ -308,7 +309,7 @@ final class Store: ObservableObject {
               t.uploaded = t.bytes
               t.speed = 0
               t.eta = nil
-            } else if !remote.accepted && remote.stage == "failed" && local.state != "preparing" {
+            } else if !remote.accepted && remote.stage == "failed" && !["preparing", "paused"].contains(local.state) {
               t.state = "error"
               t.message = remote.error
             }
@@ -414,7 +415,8 @@ final class Store: ObservableObject {
         let bookmark = try? url.bookmarkData(
           options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
         try Task.checkCancellation()
-        return ResolvedSource(url: url, bookmark: bookmark, scoped: scoped)
+        let volumeID = try? url.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        return ResolvedSource(url: url, bookmark: bookmark, scoped: scoped, volumeID: volumeID)
       } catch {
         if scoped { url.stopAccessingSecurityScopedResource() }
         throw error
@@ -431,6 +433,7 @@ final class Store: ObservableObject {
       old?.stopAccessingSecurityScopedResource()
     }
     update(task.id) {
+      $0.sourceVolumeID = result.volumeID
       $0.source = result.url.path
       if let bookmark = result.bookmark { $0.bookmark = bookmark }
     }
@@ -497,6 +500,10 @@ final class Store: ObservableObject {
             && self.tasks.first(where: { $0.id == id })?.state != "cancelled"
           {
             let failure = error as? RelayFailure
+            if failure?.sourceIO == true {
+              self.suspendSourceVolume(id, message: error.localizedDescription)
+              return
+            }
             let retry =
               (error is URLError || failure?.retryable == true || failure?.status == 500
                 || failure?.status == 503
@@ -514,6 +521,23 @@ final class Store: ObservableObject {
       if running.count >= 2 { break }
     }
   }
+  private func suspendSourceVolume(_ id: String, message: String) {
+    guard let failed = tasks.first(where: { $0.id == id }) else { return }
+    let affected = tasks.filter { SourceFaultPolicy.shouldSuspend($0, after: failed) }.map(\.id)
+    for affectedID in affected {
+      running[affectedID]?.cancel()
+      retries.removeValue(forKey: affectedID)
+      update(affectedID) {
+        $0.state = "paused"
+        $0.pendingAction = nil
+        $0.speed = 0
+        $0.eta = nil
+        $0.message = affectedID == id
+          ? message + "\n已暫停此磁碟的來源讀取，請檢查磁碟後手動繼續。"
+          : "同一來源磁碟發生讀取錯誤，已暫停以停止增加負載。\n" + message
+      }
+    }
+  }
   private func run(_ id: String) async throws {
     guard let item = tasks.first(where: { $0.id == id }), let health = health[item.serverID] else {
       throw RelayFailure("中繼未連線")
@@ -524,6 +548,7 @@ final class Store: ObservableObject {
     do {
       existing = try await api.get("v1/jobs/" + id, endpoint: endpoint, as: ServerJob.self)
     } catch { if (error as? RelayFailure)?.status != 404 { throw error } }
+    try Task.checkCancellation()
     if let remote = existing, remote.accepted {
       update(id) {
         $0.accepted = true
@@ -542,6 +567,7 @@ final class Store: ObservableObject {
         "v1/preflight", body: body, endpoint: endpoint, as: PreflightReply.self, timeout: 5),
         reply.exists
       {
+        try Task.checkCancellation()
         update(id) {
           $0.state = "awaiting_duplicate_local"
           $0.message = nil
@@ -549,6 +575,7 @@ final class Store: ObservableObject {
         return
       }
     }
+    try Task.checkCancellation()
     update(id) {
       $0.state = "resolving_source"
       $0.message = nil
@@ -808,7 +835,7 @@ final class Store: ObservableObject {
         $0.accepted = remote.accepted
         guard $0.pendingAction == action else { return }
         $0.pendingAction = nil
-        $0.message = nil
+        if action != "pause" { $0.message = nil }
         if remote.stage == "completed" {
           $0.state = "completed"
         } else if remote.stage == "cancelled" {
@@ -833,7 +860,7 @@ final class Store: ObservableObject {
         update(id) {
           guard $0.pendingAction == action else { return }
           $0.pendingAction = nil
-          $0.message = nil
+          if action != "pause" { $0.message = nil }
           $0.state = action == "cancel" ? "cancelled" : action == "pause" ? "paused" : "queued"
         }
       } else {

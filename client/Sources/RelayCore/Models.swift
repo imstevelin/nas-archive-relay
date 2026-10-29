@@ -228,6 +228,7 @@ public struct Invitation: Decodable, Sendable {
 public struct LocalTask: Codable, Identifiable, Sendable {
   public var id, name, source: String
   public var bookmark: Data?
+  public var sourceVolumeID: String?
   public var serverID, targetID, folder: String
   public var state = "queued"
   public var bytes: Int64 = 0
@@ -269,10 +270,12 @@ public struct RelayFailure: Error, LocalizedError, Sendable {
   public let message: String
   public let status: Int
   public let retryable: Bool
-  public init(_ message: String, status: Int = 0, retryable: Bool = false) {
+  public let sourceIO: Bool
+  public init(_ message: String, status: Int = 0, retryable: Bool = false, sourceIO: Bool = false) {
     self.message = message
     self.status = status
     self.retryable = retryable
+    self.sourceIO = sourceIO
   }
   public var errorDescription: String? { message }
 }

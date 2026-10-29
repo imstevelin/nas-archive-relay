@@ -815,10 +815,10 @@ struct TransferSettings: View {
   let store: Store
   let delegate: AppDelegate
   @Environment(\.openWindow) private var openWindow
-  @AppStorage(SourceReadProtection.preferenceKey) private var protectExternal = true
+  @AppStorage(SourceReadProtection.preferenceKey) private var protectExternal = false
   var body: some View {
     Form {
-      Toggle("外接磁碟穩定讀取", isOn: $protectExternal)
+      Toggle("外接磁碟限速讀取", isOn: $protectExternal)
       Text("同一顆外接磁碟的讀取共用 24 MiB/s 上限，校驗依序進行，降低大量素材同時校驗造成的負載。內建磁碟與 NAS 來源不受此設定影響。")
         .font(.callout).foregroundStyle(.secondary)
       Text("調整後，請暫停並繼續現有任務以套用設定。關閉後會恢復原本的讀取速度。")

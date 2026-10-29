@@ -32,7 +32,7 @@ final class RelayCoreTests: XCTestCase {
     XCTAssertFalse(SourceAccess.failure(denied, url: url).retryable)
     XCTAssertTrue(
       SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 2), url: url).retryable)
-    XCTAssertTrue(
+    XCTAssertFalse(
       SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 5), url: url).retryable)
     XCTAssertTrue(io.contains(url.path))
     XCTAssertTrue(io.contains("NSPOSIXErrorDomain 5"))
