@@ -223,7 +223,9 @@ final class RelayCoreTests: XCTestCase {
     task.state = "paused"
     let saved = try JSONEncoder().encode(task)
     var restored = try JSONDecoder().decode(LocalTask.self, from: saved)
-    for state in ["resuming", "checking_resume", "preparing", "checking_source", "uploading"] {
+    for state in [
+      "resuming", "checking_resume", "preparing", "checking_source", "waiting_source", "uploading",
+    ] {
       restored.state = state
       restored.preparationDone = 0
       XCTAssertEqual(restored.uploadFraction, 0.11, accuracy: 0.0001)

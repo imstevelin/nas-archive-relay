@@ -73,9 +73,12 @@ final class Store: ObservableObject {
       }.sorted { $0.created > $1.created }
       for i in tasks.indices
       where !tasks[i].accepted
-        && ["preparing", "uploading", "checking_source", "checking_destination", "checking_resume"]
-          .contains(
-            tasks[i].state)
+        && [
+          "preparing", "uploading", "checking_source", "checking_destination", "checking_resume",
+          "waiting_source",
+        ]
+        .contains(
+          tasks[i].state)
       {
         tasks[i].state = "queued"
         tasks[i].speed = 0
@@ -527,12 +530,14 @@ final class Store: ObservableObject {
       $0.message = nil
       $0.preparationDone = 0
     }
+    let activePreparation = item.uploaded > 0 ? "checking_resume" : "preparing"
     let preparingGate = ProgressGate()
+    let preparationWaiting = sourceWaitHandler(id, activeState: activePreparation)
     let progress: @Sendable (Int64, Int64) -> Void = { [weak self] done, total in
       guard preparingGate.allows(done, total) else { return }
       Task { @MainActor in
         guard let self,
-          ["preparing", "checking_resume"].contains(
+          ["preparing", "checking_resume", "waiting_source"].contains(
             self.tasks.first(where: { $0.id == id })?.state ?? "")
         else {
           return
@@ -547,14 +552,16 @@ final class Store: ObservableObject {
       manifest = try JSONDecoder().decode(Manifest.self, from: data)
       let existing = manifest
       let work = Task.detached {
-        try ManifestBuilder.verify(source: url, manifest: existing, progress: progress)
+        try ManifestBuilder.verify(
+          source: url, manifest: existing, progress: progress, waiting: preparationWaiting)
       }
       try await withTaskCancellationHandler(
         operation: { try await work.value }, onCancel: { work.cancel() })
     } else {
       let work = Task.detached {
         try ManifestBuilder.build(
-          source: url, id: id, targetID: item.targetID, folder: item.folder, progress: progress)
+          source: url, id: id, targetID: item.targetID, folder: item.folder, progress: progress,
+          waiting: preparationWaiting)
       }
       manifest = try await withTaskCancellationHandler(
         operation: { try await work.value }, onCancel: { work.cancel() })
@@ -660,19 +667,25 @@ final class Store: ObservableObject {
     }
     let owner = self
     let checkingGate = ProgressGate()
+    let checkingWaiting = sourceWaitHandler(id, activeState: "checking_source")
     let check = Task.detached {
-      try ManifestBuilder.verify(source: url, manifest: manifest) { done, total in
-        guard checkingGate.allows(done, total) else { return }
-        Task { @MainActor in
-          guard owner.tasks.first(where: { $0.id == id })?.state == "checking_source" else {
-            return
+      try ManifestBuilder.verify(
+        source: url, manifest: manifest,
+        progress: { done, total in
+          guard checkingGate.allows(done, total) else { return }
+          Task { @MainActor in
+            guard
+              ["checking_source", "waiting_source"].contains(
+                owner.tasks.first(where: { $0.id == id })?.state ?? "")
+            else {
+              return
+            }
+            owner.update(id) {
+              $0.preparationDone = done
+              $0.bytes = total
+            }
           }
-          owner.update(id) {
-            $0.preparationDone = done
-            $0.bytes = total
-          }
-        }
-      }
+        }, waiting: checkingWaiting)
     }
     try await withTaskCancellationHandler(
       operation: { try await check.value }, onCancel: { check.cancel() })
@@ -684,6 +697,16 @@ final class Store: ObservableObject {
       $0.uploaded = $0.bytes
       $0.speed = 0
       $0.eta = nil
+    }
+  }
+  private func sourceWaitHandler(_ id: String, activeState: String) -> @Sendable (Bool) -> Void {
+    { [weak self] waiting in
+      Task { @MainActor in
+        guard let self, let state = self.tasks.first(where: { $0.id == id })?.state,
+          state == activeState || state == "waiting_source"
+        else { return }
+        self.update(id) { $0.state = waiting ? "waiting_source" : activeState }
+      }
     }
   }
   func pause(_ id: String) {

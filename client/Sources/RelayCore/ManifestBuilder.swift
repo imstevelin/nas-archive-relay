@@ -65,7 +65,9 @@ public enum ManifestBuilder {
     }
     return result
   }
-  private static func digest(_ url: URL, progress: @Sendable (Int64) -> Void) throws -> String {
+  private static func digest(_ url: URL, gate: SourceReadGate?, progress: @Sendable (Int64) -> Void)
+    throws -> String
+  {
     let before = try signature(url)
     guard !before.directory else { throw RelayFailure("來源不是一般檔案") }
     let input: FileHandle
@@ -73,9 +75,11 @@ public enum ManifestBuilder {
       throw SourceAccess.failure(error, url: url)
     }
     defer { try? input.close() }
+    try SourceReadProtection.configure(input, url: url, gate: gate)
     var hash = SHA256()
     while true {
       try Task.checkCancellation()
+      try gate?.pace(bytes: 1024 * 1024)
       // Foundation's FileHandle buffers are autoreleased. Detached Swift tasks do not
       // drain a run-loop pool between chunks, so even a streaming loop can retain GBs.
       let count = try autoreleasepool { () throws -> Int in
@@ -136,8 +140,12 @@ public enum ManifestBuilder {
   }
   public static func build(
     source: URL, id: String, targetID: String, folder: String,
-    progress: @escaping @Sendable (Int64, Int64) -> Void
+    progress: @escaping @Sendable (Int64, Int64) -> Void,
+    waiting: @escaping @Sendable (Bool) -> Void = { _ in }
   ) throws -> Manifest {
+    let gate = try SourceReadProtection.gate(for: source)
+    try gate?.acquirePreparation(waiting: waiting)
+    defer { gate?.releasePreparation() }
     let before = try listing(source)
     let total = before.reduce(Int64(0)) { $0 + ($1.2.directory ? 0 : $1.2.size) }
     var completed: Int64 = 0
@@ -149,7 +157,7 @@ public enum ManifestBuilder {
       } else {
         // Hashing runs on a detached task; the callback reports cumulative bytes.
         let counter = ByteCounter(completed)
-        let hash = try digest(url) { delta in
+        let hash = try digest(url, gate: gate) { delta in
           let done = counter.add(delta)
           progress(done, total)
         }
@@ -168,8 +176,12 @@ public enum ManifestBuilder {
       id: id, name: source.lastPathComponent, targetID: targetID, folder: folder, entries: entries)
   }
   public static func verify(
-    source: URL, manifest: Manifest, progress: @escaping @Sendable (Int64, Int64) -> Void
+    source: URL, manifest: Manifest, progress: @escaping @Sendable (Int64, Int64) -> Void,
+    waiting: @escaping @Sendable (Bool) -> Void = { _ in }
   ) throws {
+    let gate = try SourceReadProtection.gate(for: source)
+    try gate?.acquirePreparation(waiting: waiting)
+    defer { gate?.releasePreparation() }
     let items = try listing(source)
     guard Set(items.map { $0.0 }) == Set(manifest.entries.map(\.path)) else {
       throw RelayFailure("原始素材清單已變動")
@@ -182,7 +194,8 @@ public enum ManifestBuilder {
       }
       if !sig.directory {
         guard sig.size == e.size,
-          try digest(url, progress: { delta in progress(counter.add(delta), manifest.bytes) })
+          try digest(
+            url, gate: gate, progress: { delta in progress(counter.add(delta), manifest.bytes) })
             == e.sha256
         else { throw RelayFailure("原始素材內容已變動，請重新加入新版本") }
       }
