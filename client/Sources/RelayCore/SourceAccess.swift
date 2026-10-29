@@ -26,7 +26,7 @@ public enum SourceAccess {
     }
   }
 
-  public static func failure(_ error: Error, url: URL) -> RelayFailure {
+  public static func failure(_ error: Error, url: URL, offset: Int64? = nil) -> RelayFailure {
     let ns = error as NSError
     var errors = [ns]
     var next = ns
@@ -50,25 +50,28 @@ public enum SourceAccess {
       : missing
         ? "來源目前無法存取。請接回硬碟；若位置已變更，請按「重新選取來源…」。"
         : "讀取來源失敗，請確認硬碟連線並重試。"
-    let temporary =
-      missing || errors.contains { $0.domain == NSPOSIXErrorDomain && [5, 60].contains($0.code) }
+    let io = !denied && !missing
+    let position = offset.map { "\n嘗試讀取起點：\($0) bytes" } ?? ""
     return RelayFailure(
-      "\(reason)\n\(url.path)\n\(ns.domain) \(ns.code)：\(ns.localizedDescription)",
-      retryable: !denied && temporary)
+      "\(reason)\n\(url.path)\(position)\n\(ns.domain) \(ns.code)：\(ns.localizedDescription)",
+      retryable: !denied && missing, sourceIO: io)
   }
 
   /// A short successful read is not EOF. Accumulate until the requested chunk is full.
   public static func readChunk(at url: URL, offset: Int64, count: Int) throws -> Data {
     do {
+      let gate = try SourceReadProtection.gate(for: url)
+      try gate?.pace(bytes: count)
       return try autoreleasepool {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
+        try SourceReadProtection.configure(input, url: url, gate: gate)
         try input.seek(toOffset: UInt64(offset))
         return try readExactly(count: count) { try input.read(upToCount: $0) }
       }
     } catch is CancellationError { throw CancellationError() } catch let failure as RelayFailure {
       throw failure
-    } catch { throw failure(error, url: url) }
+    } catch { throw failure(error, url: url, offset: offset) }
   }
   static func readExactly(count: Int, read: (Int) throws -> Data?) throws -> Data {
     var data = Data()

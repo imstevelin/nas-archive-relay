@@ -32,7 +32,7 @@ final class RelayCoreTests: XCTestCase {
     XCTAssertFalse(SourceAccess.failure(denied, url: url).retryable)
     XCTAssertTrue(
       SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 2), url: url).retryable)
-    XCTAssertTrue(
+    XCTAssertFalse(
       SourceAccess.failure(NSError(domain: NSPOSIXErrorDomain, code: 5), url: url).retryable)
     XCTAssertTrue(io.contains(url.path))
     XCTAssertTrue(io.contains("NSPOSIXErrorDomain 5"))
@@ -223,7 +223,10 @@ final class RelayCoreTests: XCTestCase {
     task.state = "paused"
     let saved = try JSONEncoder().encode(task)
     var restored = try JSONDecoder().decode(LocalTask.self, from: saved)
-    for state in ["resuming", "checking_resume", "preparing", "checking_source", "uploading"] {
+    for state in [
+      "resuming", "checking_resume", "preparing", "checking_source", "waiting_source",
+      "resolving_source", "uploading",
+    ] {
       restored.state = state
       restored.preparationDone = 0
       XCTAssertEqual(restored.uploadFraction, 0.11, accuracy: 0.0001)

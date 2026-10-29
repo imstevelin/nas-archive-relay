@@ -15,6 +15,13 @@ private struct PollResult: Sendable {
   let error: String?
 }
 
+private struct ResolvedSource: Sendable {
+  let url: URL
+  let bookmark: Data?
+  let scoped: Bool
+  let volumeID: String?
+}
+
 private final class ProgressGate: @unchecked Sendable {
   private let lock = NSLock()
   private var last: Double = 0
@@ -73,9 +80,12 @@ final class Store: ObservableObject {
       }.sorted { $0.created > $1.created }
       for i in tasks.indices
       where !tasks[i].accepted
-        && ["preparing", "uploading", "checking_source", "checking_destination", "checking_resume"]
-          .contains(
-            tasks[i].state)
+        && [
+          "preparing", "uploading", "checking_source", "checking_destination", "checking_resume",
+          "waiting_source", "resolving_source",
+        ]
+        .contains(
+          tasks[i].state)
       {
         tasks[i].state = "queued"
         tasks[i].speed = 0
@@ -299,7 +309,7 @@ final class Store: ObservableObject {
               t.uploaded = t.bytes
               t.speed = 0
               t.eta = nil
-            } else if !remote.accepted && remote.stage == "failed" && local.state != "preparing" {
+            } else if !remote.accepted && remote.stage == "failed" && !["preparing", "paused"].contains(local.state) {
               t.state = "error"
               t.message = remote.error
             }
@@ -390,21 +400,44 @@ final class Store: ObservableObject {
     error = nil
     startPending()
   }
-  private func source(_ task: LocalTask) throws -> URL {
-    // Re-resolve on each attempt: a cached URL can point at an old /Volumes mount.
-    if let old = resources.removeValue(forKey: task.id) {
-      old.stopAccessingSecurityScopedResource()
+  private func source(_ task: LocalTask) async throws -> URL {
+    // Keep the selected URL's grant alive until a replacement grant has been acquired.
+    let old = resources[task.id]
+    let work = Task.detached {
+      let url =
+        task.bookmark == nil
+        ? (old ?? URL(fileURLWithPath: task.source))
+        : SourceAccess.resolve(path: task.source, bookmark: task.bookmark)
+      let scoped = url.startAccessingSecurityScopedResource()
+      do {
+        try Task.checkCancellation()
+        try SourceAccess.check(url)
+        let bookmark = try? url.bookmarkData(
+          options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+        try Task.checkCancellation()
+        let volumeID = try? url.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        return ResolvedSource(url: url, bookmark: bookmark, scoped: scoped, volumeID: volumeID)
+      } catch {
+        if scoped { url.stopAccessingSecurityScopedResource() }
+        throw error
+      }
     }
-    let url = SourceAccess.resolve(path: task.source, bookmark: task.bookmark)
-    if url.startAccessingSecurityScopedResource() { resources[task.id] = url }
-    try SourceAccess.check(url)
-    let bookmark = try? url.bookmarkData(
-      options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+    let result = try await withTaskCancellationHandler(
+      operation: { try await work.value }, onCancel: { work.cancel() })
+    guard !Task.isCancelled else {
+      if result.scoped { result.url.stopAccessingSecurityScopedResource() }
+      throw CancellationError()
+    }
+    if result.scoped {
+      resources[task.id] = result.url
+      old?.stopAccessingSecurityScopedResource()
+    }
     update(task.id) {
-      $0.source = url.path
-      if let bookmark { $0.bookmark = bookmark }
+      $0.sourceVolumeID = result.volumeID
+      $0.source = result.url.path
+      if let bookmark = result.bookmark { $0.bookmark = bookmark }
     }
-    return url
+    return result.url
   }
 
   func reselectSource(_ id: String) {
@@ -467,6 +500,10 @@ final class Store: ObservableObject {
             && self.tasks.first(where: { $0.id == id })?.state != "cancelled"
           {
             let failure = error as? RelayFailure
+            if failure?.sourceIO == true {
+              self.suspendSourceVolume(id, message: error.localizedDescription)
+              return
+            }
             let retry =
               (error is URLError || failure?.retryable == true || failure?.status == 500
                 || failure?.status == 503
@@ -484,6 +521,23 @@ final class Store: ObservableObject {
       if running.count >= 2 { break }
     }
   }
+  private func suspendSourceVolume(_ id: String, message: String) {
+    guard let failed = tasks.first(where: { $0.id == id }) else { return }
+    let affected = tasks.filter { SourceFaultPolicy.shouldSuspend($0, after: failed) }.map(\.id)
+    for affectedID in affected {
+      running[affectedID]?.cancel()
+      retries.removeValue(forKey: affectedID)
+      update(affectedID) {
+        $0.state = "paused"
+        $0.pendingAction = nil
+        $0.speed = 0
+        $0.eta = nil
+        $0.message = affectedID == id
+          ? message + "\n已暫停此磁碟的來源讀取，請檢查磁碟後手動繼續。"
+          : "同一來源磁碟發生讀取錯誤，已暫停以停止增加負載。\n" + message
+      }
+    }
+  }
   private func run(_ id: String) async throws {
     guard let item = tasks.first(where: { $0.id == id }), let health = health[item.serverID] else {
       throw RelayFailure("中繼未連線")
@@ -494,6 +548,7 @@ final class Store: ObservableObject {
     do {
       existing = try await api.get("v1/jobs/" + id, endpoint: endpoint, as: ServerJob.self)
     } catch { if (error as? RelayFailure)?.status != 404 { throw error } }
+    try Task.checkCancellation()
     if let remote = existing, remote.accepted {
       update(id) {
         $0.accepted = true
@@ -512,6 +567,7 @@ final class Store: ObservableObject {
         "v1/preflight", body: body, endpoint: endpoint, as: PreflightReply.self, timeout: 5),
         reply.exists
       {
+        try Task.checkCancellation()
         update(id) {
           $0.state = "awaiting_duplicate_local"
           $0.message = nil
@@ -519,7 +575,12 @@ final class Store: ObservableObject {
         return
       }
     }
-    let url = try source(item)
+    try Task.checkCancellation()
+    update(id) {
+      $0.state = "resolving_source"
+      $0.message = nil
+    }
+    let url = try await source(item)
     let manifestURL = directory(id).appendingPathComponent("manifest.json")
     var manifest: Manifest
     update(id) {
@@ -527,12 +588,14 @@ final class Store: ObservableObject {
       $0.message = nil
       $0.preparationDone = 0
     }
+    let activePreparation = item.uploaded > 0 ? "checking_resume" : "preparing"
     let preparingGate = ProgressGate()
+    let preparationWaiting = sourceWaitHandler(id, activeState: activePreparation)
     let progress: @Sendable (Int64, Int64) -> Void = { [weak self] done, total in
       guard preparingGate.allows(done, total) else { return }
       Task { @MainActor in
         guard let self,
-          ["preparing", "checking_resume"].contains(
+          ["preparing", "checking_resume", "waiting_source"].contains(
             self.tasks.first(where: { $0.id == id })?.state ?? "")
         else {
           return
@@ -547,14 +610,16 @@ final class Store: ObservableObject {
       manifest = try JSONDecoder().decode(Manifest.self, from: data)
       let existing = manifest
       let work = Task.detached {
-        try ManifestBuilder.verify(source: url, manifest: existing, progress: progress)
+        try ManifestBuilder.verify(
+          source: url, manifest: existing, progress: progress, waiting: preparationWaiting)
       }
       try await withTaskCancellationHandler(
         operation: { try await work.value }, onCancel: { work.cancel() })
     } else {
       let work = Task.detached {
         try ManifestBuilder.build(
-          source: url, id: id, targetID: item.targetID, folder: item.folder, progress: progress)
+          source: url, id: id, targetID: item.targetID, folder: item.folder, progress: progress,
+          waiting: preparationWaiting)
       }
       manifest = try await withTaskCancellationHandler(
         operation: { try await work.value }, onCancel: { work.cancel() })
@@ -660,19 +725,25 @@ final class Store: ObservableObject {
     }
     let owner = self
     let checkingGate = ProgressGate()
+    let checkingWaiting = sourceWaitHandler(id, activeState: "checking_source")
     let check = Task.detached {
-      try ManifestBuilder.verify(source: url, manifest: manifest) { done, total in
-        guard checkingGate.allows(done, total) else { return }
-        Task { @MainActor in
-          guard owner.tasks.first(where: { $0.id == id })?.state == "checking_source" else {
-            return
+      try ManifestBuilder.verify(
+        source: url, manifest: manifest,
+        progress: { done, total in
+          guard checkingGate.allows(done, total) else { return }
+          Task { @MainActor in
+            guard
+              ["checking_source", "waiting_source"].contains(
+                owner.tasks.first(where: { $0.id == id })?.state ?? "")
+            else {
+              return
+            }
+            owner.update(id) {
+              $0.preparationDone = done
+              $0.bytes = total
+            }
           }
-          owner.update(id) {
-            $0.preparationDone = done
-            $0.bytes = total
-          }
-        }
-      }
+        }, waiting: checkingWaiting)
     }
     try await withTaskCancellationHandler(
       operation: { try await check.value }, onCancel: { check.cancel() })
@@ -684,6 +755,16 @@ final class Store: ObservableObject {
       $0.uploaded = $0.bytes
       $0.speed = 0
       $0.eta = nil
+    }
+  }
+  private func sourceWaitHandler(_ id: String, activeState: String) -> @Sendable (Bool) -> Void {
+    { [weak self] waiting in
+      Task { @MainActor in
+        guard let self, let state = self.tasks.first(where: { $0.id == id })?.state,
+          state == activeState || state == "waiting_source"
+        else { return }
+        self.update(id) { $0.state = waiting ? "waiting_source" : activeState }
+      }
     }
   }
   func pause(_ id: String) {
@@ -754,7 +835,7 @@ final class Store: ObservableObject {
         $0.accepted = remote.accepted
         guard $0.pendingAction == action else { return }
         $0.pendingAction = nil
-        $0.message = nil
+        if action != "pause" { $0.message = nil }
         if remote.stage == "completed" {
           $0.state = "completed"
         } else if remote.stage == "cancelled" {
@@ -779,7 +860,7 @@ final class Store: ObservableObject {
         update(id) {
           guard $0.pendingAction == action else { return }
           $0.pendingAction = nil
-          $0.message = nil
+          if action != "pause" { $0.message = nil }
           $0.state = action == "cancel" ? "cancelled" : action == "pause" ? "paused" : "queued"
         }
       } else {

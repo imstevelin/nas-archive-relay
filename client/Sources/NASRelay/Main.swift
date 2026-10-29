@@ -26,7 +26,9 @@ func phase(_ value: String) -> String {
   [
     "checking_destination": "檢查歸檔位置", "awaiting_duplicate_local": "NAS 已有同名項目，請選擇處理方式",
     "awaiting_duplicate": "NAS 已有同名項目，請選擇處理方式", "queued": "等待歸檔", "receiving": "等待素材上傳",
-    "checking_resume": "確認素材與續傳位置", "preparing": "建立 SHA-256 清單", "uploading": "傳送素材",
+    "resolving_source": "確認來源磁碟", "waiting_source": "等待同一顆硬碟完成校驗", "checking_resume": "確認素材與續傳位置",
+    "preparing": "建立 SHA-256 清單",
+    "uploading": "傳送素材",
     "checking_source": "確認原始素材", "verifying_receive": "中繼接收校驗", "handed_off": "已完整交接",
     "paused": "已暫停", "pausing": "正在暫停", "resuming": "正在恢復", "copying": "上傳 NAS",
     "checking_relay": "檢查中繼內容", "checking_existing": "比對 NAS 既有內容", "verifying_nas": "校驗 NAS 內容",
@@ -395,7 +397,10 @@ struct TaskRow: View {
           Text(
             (store.profiles.first { $0.id == task.serverID }?.name ?? "中繼") + " · "
               + (task.bytes == 0
-                && ["preparing", "checking_destination", "awaiting_duplicate_local"].contains(
+                && [
+                  "preparing", "checking_destination", "awaiting_duplicate_local", "waiting_source",
+                  "resolving_source",
+                ].contains(
                   task.state)
                 ? "尚未傳送" : bytes(task.bytes))
           ).font(.caption).foregroundStyle(.secondary)
@@ -440,6 +445,12 @@ struct TaskRow: View {
             }.menuStyle(.borderlessButton).fixedSize().help("使用另一台中繼重新傳送素材")
           }
         }
+      }
+      if ["preparing", "checking_resume", "checking_source"].contains(task.state), task.bytes > 0 {
+        Text(
+          "素材校驗：\(bytes(task.preparationDone)) / \(bytes(task.bytes))（\(Int(min(1, max(0, Double(task.preparationDone) / Double(task.bytes))) * 100))%）"
+        )
+        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
       }
       if task.state == "awaiting_duplicate_local"
         || ["awaiting_duplicate", "conflict"].contains(remote?.stage ?? "")
@@ -784,7 +795,7 @@ struct MainView: View {
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
   func applicationWillTerminate(_ notification: Notification) { store?.stop() }
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-    if !hasVisibleWindows { showMainWindow?() }
+    showMainWindow?()
     sender.activate(ignoringOtherApps: true)
     return false
   }
@@ -800,6 +811,25 @@ struct MainWindowContent: View {
     }
   }
 }
+struct TransferSettings: View {
+  let store: Store
+  let delegate: AppDelegate
+  @Environment(\.openWindow) private var openWindow
+  @AppStorage(SourceReadProtection.preferenceKey) private var protectExternal = false
+  var body: some View {
+    Form {
+      Toggle("外接磁碟限速讀取", isOn: $protectExternal)
+      Text("同一顆外接磁碟的讀取共用 24 MiB/s 上限，校驗依序進行，降低大量素材同時校驗造成的負載。內建磁碟與 NAS 來源不受此設定影響。")
+        .font(.callout).foregroundStyle(.secondary)
+      Text("調整後，請暫停並繼續現有任務以套用設定。關閉後會恢復原本的讀取速度。")
+        .font(.caption).foregroundStyle(.secondary)
+    }.padding(24).frame(width: 440).navigationTitle("傳輸")
+      .onAppear {
+        delegate.store = store
+        delegate.showMainWindow = { openWindow(id: "main") }
+      }
+  }
+}
 @main struct NASRelayApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
   @StateObject private var store = Store()
@@ -812,5 +842,6 @@ struct MainWindowContent: View {
           Button("重新整理連線") { Task { await store.refresh() } }.keyboardShortcut("r")
         }
       }
+    Settings { TransferSettings(store: store, delegate: delegate) }
   }
 }
