@@ -26,6 +26,7 @@ type Server struct {
 	ingest         chan struct{}
 	archive        chan struct{}
 	cleanup        chan struct{}
+	relayCleanup   chan struct{}
 	preflightSlots chan struct{}
 }
 
@@ -34,7 +35,7 @@ func NewServer(s *Store) *Server {
 	if workers < 1 {
 		workers = 1
 	}
-	return &Server{Store: s, ResolveTarget: s.EnsureMount, ingest: make(chan struct{}, 1), archive: make(chan struct{}, workers), cleanup: make(chan struct{}, 1), preflightSlots: make(chan struct{}, 2)}
+	return &Server{Store: s, ResolveTarget: s.EnsureMount, ingest: make(chan struct{}, 1), archive: make(chan struct{}, workers), cleanup: make(chan struct{}, 1), relayCleanup: make(chan struct{}, 1), preflightSlots: make(chan struct{}, 2)}
 }
 func write(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -186,8 +187,14 @@ func (a *Server) Handler() http.Handler {
 }
 func (a *Server) info(w http.ResponseWriter, r *http.Request) {
 	c := a.Store.Snapshot()
-	free, _ := freeSpace(a.Store.Root)
-	write(w, 200, map[string]any{"server_id": c.ID, "name": c.Name, "version": Version, "endpoints": c.Endpoints, "role": principal(r).Role, "client_id": principal(r).ID, "default_target": c.DefaultTarget, "default_folder": c.DefaultFolder, "free_bytes": free, "reserve_bytes": c.ReserveBytes, "chunk_size": ChunkSize})
+	a.Store.mu.Lock()
+	space, err := a.Store.capacityLocked()
+	a.Store.mu.Unlock()
+	if err != nil {
+		problem(w, 500, err)
+		return
+	}
+	write(w, 200, map[string]any{"server_id": c.ID, "name": c.Name, "version": Version, "endpoints": c.Endpoints, "role": principal(r).Role, "client_id": principal(r).ID, "default_target": c.DefaultTarget, "default_folder": c.DefaultFolder, "free_bytes": space.FreeBytes, "reserve_bytes": space.ReserveBytes, "total_bytes": space.TotalBytes, "reserved_upload_bytes": space.ReservedUploads, "available_upload_bytes": space.AvailableUploads, "cleanup_pending_bytes": space.CleanupPendingBytes, "cleanup_pending_jobs": space.CleanupPendingJobs, "chunk_size": ChunkSize})
 }
 func (a *Server) settings(w http.ResponseWriter, r *http.Request) {
 	if !admin(w, r) {
@@ -300,22 +307,13 @@ func (a *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Store.mu.Lock()
 	defer a.Store.mu.Unlock()
-	free, err := freeSpace(a.Store.Root)
+	space, err := a.Store.capacityLocked()
 	if err != nil {
 		problem(w, 500, err)
 		return
 	}
-	reserved := int64(0)
-	for _, j := range a.Store.Jobs {
-		if !j.Accepted && j.Stage != "cancelled" && j.Stage != "failed" {
-			remaining := j.Bytes - j.Done
-			if remaining > 0 {
-				reserved += remaining
-			}
-		}
-	}
-	if free-a.Store.Config.ReserveBytes-reserved < total {
-		problem(w, 507, errors.New("insufficient relay space including reserved uploads"))
+	if space.AvailableUploads < total {
+		write(w, 507, map[string]any{"error": "insufficient relay space including reserved uploads", "required_bytes": total, "available_upload_bytes": space.AvailableUploads, "free_bytes": space.FreeBytes, "reserved_upload_bytes": space.ReservedUploads, "reserve_bytes": space.ReserveBytes})
 		return
 	}
 	root := a.Store.jobPath(m.ID, "payload")

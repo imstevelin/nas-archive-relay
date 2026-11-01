@@ -309,7 +309,9 @@ final class Store: ObservableObject {
               t.uploaded = t.bytes
               t.speed = 0
               t.eta = nil
-            } else if !remote.accepted && remote.stage == "failed" && !["preparing", "paused"].contains(local.state) {
+            } else if !remote.accepted && remote.stage == "failed"
+              && !["preparing", "paused"].contains(local.state)
+            {
               t.state = "error"
               t.message = remote.error
             }
@@ -532,7 +534,8 @@ final class Store: ObservableObject {
         $0.pendingAction = nil
         $0.speed = 0
         $0.eta = nil
-        $0.message = affectedID == id
+        $0.message =
+          affectedID == id
           ? message + "\n已暫停此磁碟的來源讀取，請檢查磁碟後手動繼續。"
           : "同一來源磁碟發生讀取錯誤，已暫停以停止增加負載。\n" + message
       }
@@ -556,6 +559,15 @@ final class Store: ObservableObject {
         $0.state = remote.stage == "completed" ? "completed" : "handed_off"
       }
       return
+    }
+    // Capacity polling avoids repeatedly hashing a large source while waiting for space.
+    // The server still makes the authoritative, serialized admission decision.
+    if existing == nil, item.bytes > 0, let available = health.info.available_upload_bytes,
+      available < item.bytes
+    {
+      throw RelayFailure(
+        "等待中繼空間：任務需要 \(ByteCountFormatter.string(fromByteCount: item.bytes, countStyle: .file))，目前可再接收 \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file))。空間釋放後會自動續傳。",
+        status: 507)
     }
     if existing == nil && item.duplicateChoice == nil {
       update(id) { $0.state = "checking_destination" }
