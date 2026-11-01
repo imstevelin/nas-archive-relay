@@ -2,6 +2,11 @@ import CryptoKit
 import Foundation
 import Security
 
+private struct RelayAPIErrorBody: Decodable {
+  let error: String?
+  let required_bytes, available_upload_bytes: Int64?
+}
+
 public enum CredentialVault {
   private static let service = "net.imstevelin.NASRelay.credentials"
   public static func set(_ value: String, key: String) throws {
@@ -122,9 +127,16 @@ public final class RelayAPI: @unchecked Sendable {
   {
     guard let response = response as? HTTPURLResponse else { throw RelayFailure("無效的伺服器回覆") }
     guard (200..<300).contains(response.statusCode) else {
-      let message =
-        (try? JSONDecoder().decode([String: String].self, from: data)["error"])
-        ?? "HTTP \(response.statusCode)"
+      let body = try? JSONDecoder().decode(RelayAPIErrorBody.self, from: data)
+      var message = body?.error ?? "HTTP \(response.statusCode)"
+      if response.statusCode == 507 {
+        if let required = body?.required_bytes, let available = body?.available_upload_bytes {
+          message =
+            "中繼空間不足：任務需要 \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file))，目前可再接收 \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file))。完成歸檔並釋放空間後會自動重試。"
+        } else {
+          message = "中繼空間不足（已扣除安全保留與既有上傳預留），空間釋放後會自動重試。"
+        }
+      }
       throw RelayFailure(message, status: response.statusCode)
     }
     return try JSONDecoder().decode(T.self, from: data)

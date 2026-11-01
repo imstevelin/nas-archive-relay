@@ -148,6 +148,9 @@ public struct ServerInfo: Decodable, Sendable {
   public let server_id, name, version, role, client_id, default_target, default_folder: String
   public let endpoints: [String]
   public let free_bytes, reserve_bytes, chunk_size: Int64
+  public let total_bytes, reserved_upload_bytes, available_upload_bytes,
+    cleanup_pending_bytes: Int64?
+  public let cleanup_pending_jobs: Int?
 }
 public struct Ping: Decodable, Sendable {
   public let server_id, name, version, client_id, role: String

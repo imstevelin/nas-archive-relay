@@ -37,6 +37,42 @@ func phase(_ value: String) -> String {
   ][value] ?? value
 }
 
+struct RelayStorageView: View {
+  let info: ServerInfo
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack {
+        Label(
+          info.available_upload_bytes.map { "中繼可再接收 " + bytes($0) }
+            ?? "中繼磁碟剩餘 " + bytes(info.free_bytes), systemImage: "internaldrive"
+        )
+        .font(.callout.weight(.medium))
+        Spacer()
+        if let total = info.total_bytes, total > 0 {
+          Text("總容量 " + bytes(total)).font(.caption).foregroundStyle(.secondary)
+        }
+      }
+      if let total = info.total_bytes, total > 0 {
+        ProgressView(value: Double(max(0, total - info.free_bytes)), total: Double(total))
+          .tint((info.available_upload_bytes ?? 1) == 0 ? .orange : .accentColor)
+      }
+      if let reserved = info.reserved_upload_bytes {
+        Text(
+          "磁碟剩餘 \(bytes(info.free_bytes)) · 上傳預留 \(bytes(reserved)) · 安全保留 \(bytes(info.reserve_bytes))"
+        )
+        .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("升級服務端後可顯示扣除上傳預留的實際可接收空間。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      if let pending = info.cleanup_pending_jobs, pending > 0 {
+        Text("\(pending) 項已結束任務正在釋放中繼暫存，約 \(bytes(info.cleanup_pending_bytes ?? 0))")
+          .font(.caption).foregroundStyle(.orange)
+      }
+    }.textSelection(.enabled)
+  }
+}
+
 struct ImportView: View {
   @ObservedObject var store: Store
   @Environment(\.dismiss) var dismiss
@@ -218,6 +254,7 @@ struct ServerManager: View {
         Label(info.endpoint + String(format: "  ·  %.1f ms", info.latency), systemImage: "network")
           .font(.caption).foregroundStyle(.secondary)
       }
+      if let info { GroupBox("中繼儲存空間") { RelayStorageView(info: info.info).padding(8) } }
       GroupBox("NAS 目標") {
         VStack(alignment: .leading, spacing: 12) {
           ForEach(info?.targets ?? []) { target in
@@ -608,6 +645,10 @@ struct MainView: View {
                 if let h = store.health[profile.id] {
                   Text(String(format: "已連線 · %.0f ms", h.latency)).font(.caption).foregroundStyle(
                     .secondary)
+                  Text(
+                    h.info.available_upload_bytes.map { "可接收 " + bytes($0) }
+                      ?? "磁碟剩餘 " + bytes(h.info.free_bytes)
+                  ).font(.caption2).foregroundStyle(.secondary)
                 } else {
                   Text(store.connectionErrors[profile.id] == nil ? "連線中…" : "無法連線").font(.caption)
                     .foregroundStyle(.secondary)
@@ -672,6 +713,9 @@ struct MainView: View {
                 Spacer()
                 Button("變更…") { destination = true }
               }.padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+              if let id = store.activeServer, let health = store.health[id] {
+                RelayStorageView(info: health.info)
+              }
               VStack(spacing: 10) {
                 Image(systemName: "arrow.up.doc").font(.system(size: 26)).foregroundStyle(.tint)
                 Text("將檔案或資料夾拖到這裡").font(.headline)

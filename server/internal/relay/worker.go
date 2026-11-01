@@ -128,6 +128,34 @@ func (a *Server) dispatch() {
 	a.Store.mu.Unlock()
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Created < jobs[j].Created })
 	for _, j := range jobs {
+		// Local deletion must not queue behind a blocked NAS cleanup.
+		if (j.Stage == "completed" || j.Stage == "cancelled") && !j.RelayClean && (j.Stage == "cancelled" || a.Store.hasCompletionReceipt(j)) {
+			if j.RetryAt > time.Now().UnixMilli() {
+				continue
+			}
+			if _, loaded := a.active.LoadOrStore(j.ID, true); loaded {
+				continue
+			}
+			select {
+			case a.relayCleanup <- struct{}{}:
+				go func(id string) {
+					defer func() { <-a.relayCleanup; a.active.Delete(id) }()
+					lock := a.Store.lock(id)
+					lock.Lock()
+					defer lock.Unlock()
+					if err := a.cleanupRelayFinished(id); err != nil {
+						_ = a.Store.Update(id, func(v *Job) error {
+							v.CleanupError = err.Error()
+							v.RetryAt = time.Now().Add(30 * time.Second).UnixMilli()
+							return nil
+						})
+					}
+				}(j.ID)
+			default:
+				a.active.Delete(j.ID)
+			}
+			continue
+		}
 		if ((j.Stage == "completed" || j.Stage == "cancelled") && (!j.RelayClean || !j.NASClean)) || ((j.Stage == "failed" || j.Stage == "conflict") && !j.NASClean) {
 			if j.RetryAt > time.Now().UnixMilli() {
 				continue
@@ -460,6 +488,11 @@ func (a *Server) cleanupFinished(id, destination string, recheck bool) error {
 		}
 		return a.Store.Update(id, func(v *Job) error { v.RelayClean = true; v.NASClean = true; v.CleanupError = ""; return nil })
 	}
+	// A completed, receipt-backed archive (or explicit cancellation) no longer needs relay bytes.
+	if err := a.cleanupRelayFinished(id); err != nil {
+		return err
+	}
+	j, _ = a.Store.Job(id)
 	if destination == "" {
 		t, ok := a.Store.Target(j.TargetID)
 		if !ok {

@@ -32,3 +32,9 @@ Manifest 具有隨機32位小寫hex `id`、`name`、`target_id`、相對 `folder
 Manifest 可帶 `collision_policy: "use-existing" | "keep-both"`，表示使用者已在上傳前做出選擇。省略時，如果 NAS 已有同名內容，工作進入 `awaiting_duplicate`，必須 POST `use-existing`、`keep-both` 或 `cancel`。普通 resume 不能代替確認。use-existing 只接受完整相同內容，差異會進入 conflict；keep-both 以獨立副本名稱歸檔，`archive_name` 回覆實際名稱。
 
 NAS 暫存位於可見的 `素材名（上傳中）.nasrelay-JOB_ID`、`素材名（校驗中）.nasrelay-JOB_ID` 目錄，ID 隔離多用戶的同名任務。全部內容校驗通過後才建立原名。錯誤或終止清除具有正確任務標記的暫存；中繼的已驗證來源在歸檔完成前保留，終止時才清除。網路失聯導致清理暫時不可行時，狀態保留 pending 並在恢復後重試。
+
+## 中繼容量（v0.5）
+
+`GET /v1/info` 增加 `total_bytes`、`reserved_upload_bytes`、`available_upload_bytes`、`cleanup_pending_bytes`、`cleanup_pending_jobs`。`free_bytes` 是磁碟實體剩餘；可接收量為 `max(0, free_bytes - reserve_bytes - reserved_upload_bytes)`。上傳預留依已持久保存的 upload journal 扣除已收到的內容，包含暫停中仍可續傳的任務；不使用接收校驗階段會重設的進度。
+
+建立任務的 507 回覆包含 `error`、`required_bytes`、`available_upload_bytes`、`free_bytes`、`reserve_bytes`、`reserved_upload_bytes`。容量查詢是即時快照，建立任務仍會在伺服器鎖內重新核對。

@@ -281,13 +281,14 @@ func ensureDirs(base, relative string) (string, error) {
 	}
 	return current, nil
 }
-func freeSpace(p string) (int64, error) {
+func diskSpace(p string) (free, total int64, err error) {
 	var stat syscall.Statfs_t
-	if err := syscall.Statfs(p, &stat); err != nil {
-		return 0, err
+	if err = syscall.Statfs(p, &stat); err != nil {
+		return 0, 0, err
 	}
-	return int64(stat.Bavail) * int64(stat.Bsize), nil
+	return int64(stat.Bavail) * int64(stat.Bsize), int64(stat.Blocks) * int64(stat.Bsize), nil
 }
+func freeSpace(p string) (int64, error) { free, _, err := diskSpace(p); return free, err }
 func (s *Store) TestTarget(t Target) (map[string]any, error) {
 	s.management.RLock()
 	defer s.management.RUnlock()
